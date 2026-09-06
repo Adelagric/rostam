@@ -1,5 +1,24 @@
 # A/B Benchmark: Primary-Backup vs Raft
 
+> **STATUS 2026-09-06 — outcome.** The real-separate-machine gate below, with the
+> pipelined engine, found **PB RF=2 beats raft ~1.7× on throughput** (median/p50
+> latency also better; note PB's p99 there is comparable-to-slightly-worse, while
+> co-located runs show PB p99.9 far better — so the honest tail story is mixed),
+> while **PB RF=3 full-ISR loses to raft's majority**. `-replication-mode=pb` is
+> promoted out of experimental **primarily on the correctness case** (all three
+> blocking hazards closed with passing tests — see DESIGN.md), with **RF=2 as the
+> recommended config**; raft stays the default (it wins at RF=3). PERF CAVEAT: the
+> gate's raft baseline ran under the OLD epoll inline-dispatch default (see the
+> §2026-07-22 epoll section), which the file notes is ~pessimistic for raft, so
+> **the RF=2 margin remains unverified under the current goroutine-server default**
+> — re-run it on your hardware. The 2026-08 12-vCPU numbers further below are
+> PB-vs-Aerospike (no raft control), not a raft reproduction. The "stays
+> EXPERIMENTAL / off" conclusions in the historical sections predate the pipelined
+> engine and the RF=2 finding — read them as the record of how the verdict
+> evolved, not the current status. NOTE ON THE PROCEDURE BELOW: the gate runbook
+> and most tables use `replication-factor=3` (the comparison config); the
+> recommended production rollout is `-replication-factor 2` with `-min-isr 2`.
+
 This document is the go/no-go **gate** for the dual-mode replication feature
 (see `DUAL-MODE-DESIGN.md`). A launchable static 3-node
 primary-backup (PB/ISR) cluster alongside the existing per-shard-Raft cluster.

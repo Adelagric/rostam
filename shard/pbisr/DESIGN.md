@@ -94,9 +94,19 @@ caught-up member, (c) the H2 read confirmation. All three are mandatory for v1.
 
 ## Open hazards (MUST be closed before pb-isr is trusted with data)
 
+> **STATUS 2026-09-06 — all three CLOSED in code.** OH1 (incl. the MetaRaft
+> half), OH2, and OH3 are closed with named guards and passing tests; the
+> per-hazard "STILL PENDING" notes below are historical. See the STATUS block at
+> the top of this repo's pbisr work and `cluster/pb_failover.go` /
+> `cluster/config.go:394-401` (the OH1 honor-rule construction guard) +
+> `cluster/pb_partition_test.go` (the partition e2e). `-replication-mode=pb` is
+> no longer experimental (raft stays the default for RF=3 performance reasons).
+> Remaining hardening, not correctness holes: a PB-mode linearizable
+> stale-primary-read e2e, and a long nosync bake.
+
 An adversarial review (2026-07-20) found the backup-side epoch fence is NOT a
-sufficient defense on its own. These are tracked, unresolved, and gate any
-non-experimental use:
+sufficient defense on its own. These were tracked as gating non-experimental use
+(now closed — see the status note above):
 
 - **OH1 — co-partitioned stale quorum loses an acked write (CRITICAL). —
   WRITE PATH CLOSED IN-ENGINE (2026-07-20); MetaRaft half PENDING.**
@@ -135,7 +145,18 @@ non-experimental use:
     shrink (out of scope here). See `TestOH1StalePrimarySelfFencesOnLeaseExpiry`,
     `TestLeaseRenewalReenablesPropose`, `TestFullISRCommitRequiresEveryMember`.
 
-  **STILL PENDING (MetaRaft half — NOT in this engine):** the engine fix is
+  **MetaRaft half — CLOSED (2026-09-06; this text below is the original
+  requirement, now implemented).** Enforced by construction in
+  `cluster/config.go:394-401` (`failoverTimeout > pbLeaseTTL +
+  metaContactStaleness + renewInterval + failoverTick`) + the failover ticker in
+  `cluster/pb_failover.go` (`decidePBPromotions` gates every epoch bump on
+  `nowNs - lastRenewNs > failoverTimeout`), verified by
+  `TestPBFailoverPartitionNoDoublePrimary` (P's last ack strictly precedes Q's
+  promotion). IMPORTANT SCOPE: the lease-lapse precondition lives in that
+  promotion PATH, not inside `ApplySetShardEpoch` itself (the raw op only enforces
+  epoch monotonicity) — `pbFailover.tick` → `decidePBPromotions` (cluster/pb_failover.go)
+  is the sole production promotion caller today, and any future promotion path MUST
+  reuse the same `failoverTimeout` timing gate or the intersection argument breaks. The engine fix is
   necessary but NOT sufficient on its own. Promotion-completeness is enforced at
   MetaRaft, not here: MetaRaft MUST NOT grant epoch E+1 to any node until the
   epoch-E lease has PROVABLY lapsed (grant the next lease strictly after the prior
@@ -146,13 +167,25 @@ non-experimental use:
   NOTE: H2 linearizable reads will share this SAME lease (a fenced primary whose
   lease lapsed must not serve a stale linearizable read either).
 
-- **OH2 — apply-before-quorum uncommitted tail.** The primary applies locally
-  before quorum; a quorum-timeout write is applied but not committed. Safety
-  provisos, now partially enforced in code: `committed` (the min-ISR
-  high-watermark) is tracked separately from `lastSeq`/`lastApplied`; P3
-  linearizable reads and P4 failover election MUST key off `committed` only. An
-  in-memory FSM cannot truncate an uncommitted tail, so a demoted ex-primary
-  MUST be snapshot-reloaded, never ring-delta rejoined (P4 constraint).
+- **OH2 — apply-before-quorum uncommitted tail. Acked-loss-safe (2026-09-06),
+  but read the precise mechanism — the "P4 election keys off committed" proviso
+  below was NOT implemented literally.** `committed` (the min-ISR high-watermark)
+  is tracked separately from `lastSeq`/`lastApplied` (engine.go). **Reads DO key
+  off `committed` only:** `pbReplicator.CommitIndex()` and `AppliedIndex()` both
+  return `Engine.Committed()` (shard/pb_replicator.go:58-59), so a read never sees
+  the uncommitted tail. **Failover election does NOT rank by `committed`** — it
+  ranks ISR survivors by applied high-water (`pbCandidateHighWater` →
+  `Engine.LastApplied()` / the remote `AppliedSeq`, cluster/pb_grow.go), and
+  `Promote` then commits the winner's tail (`committed = lastApplied`,
+  engine.go). That is still **no-acked-loss** because full-ISR commit means every
+  current-ISR member already holds every *acked* (committed) write, so promoting
+  any reachable ISR survivor preserves all acked writes; the extra tail it commits
+  was in-flight and never client-acked (resolving it as "succeeded" is
+  linearizable). Net: the guarantee holds via full-ISR completeness, not via
+  committed-ranked election. A demoted ex-primary MUST be snapshot-reloaded, never
+  ring-delta rejoined (enforced by the log-match + poison fence). Historical
+  proviso text follows; treat "MUST key off committed only" as the original design
+  intent, not what shipped.
 
 - **OH3 — epoch-blind gap check.** `lastApplied` is a bare seq; the gap check is
   numeric. On an epoch increase a snapshot/rebase is required rather than
@@ -160,11 +193,19 @@ non-experimental use:
 
 ## Read barrier
 
+> **AS SHIPPED (2026-09-06): lease-based, not the ISR-quorum RTT below.** The
+> implemented linearizable read barrier is the OH1 primary lease, reused: a read
+> is served only when this node is the primary AND its lease is valid
+> (`pbReplicator.VerifyLeader` → `Engine.LeaseValid()`), and it reads at
+> `Engine.Committed()` (`AppliedIndex()`), never the uncommitted tail. This is the
+> cheaper design OH1 opted into (no per-read ISR round-trip); the ISR-quorum
+> approach below is the original, superseded design.
+
 - AnyReplica / LeaderOnly (default paths): unchanged, cheap (no consensus).
-- Linearizable: `pbReplicator.verifyPrimaryAndCatchUp(deadline)` — confirm
-  current epoch with an ISR quorum, then ensure local FSM has applied through
-  the high-water `seq` the quorum reports. Mirrors the existing
-  `verifyLeaderAndCatchUp` (shard/store.go:389) one-for-one.
+- Linearizable (original design, NOT shipped): `verifyPrimaryAndCatchUp(deadline)`
+  — confirm current epoch with an ISR quorum, then ensure local FSM has applied
+  through the high-water `seq` the quorum reports. Superseded by the lease barrier
+  above.
 
 ## Durability tiers
 
@@ -215,5 +256,8 @@ non-experimental use:
   stale-primary-read, lagging-backup — the H1–H6 acceptance gate. Must match the
   existing shard/linearizable_*_test.go and cluster/partition_test.go rigor.
 
-Default stays `raft` until P6 is green and a long nosync bake passes. No in-place
-hot switch on a live shard.
+Default stays `raft` (for RF=3 performance — PB's full-ISR commit loses to raft's
+majority there; PB's win is at RF=2). PB is promoted out of experimental as of
+2026-09-06: P6 is green except a PB-mode linearizable stale-primary-read e2e
+(remaining hardening), and a long nosync bake is still recommended before
+relying on PB for critical data. No in-place hot switch on a live shard.
