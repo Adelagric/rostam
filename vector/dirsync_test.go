@@ -82,6 +82,26 @@ func TestRenameDurable(t *testing.T) {
 	if err := renameDurable(src, filepath.Join(dir, "nope", "dst")); err == nil {
 		t.Fatal("expected error renaming into missing dir, got nil")
 	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Fatalf("staging file left behind after failed rename: %v", err)
+	}
+}
+
+// TestAtomicWriteFileRenameFailureCleansTmp pins the failed-rename cleanup: a
+// target that is an existing DIRECTORY makes the final rename fail after the
+// staging file was written and fsync'd, and the .tmp must not survive it.
+func TestAtomicWriteFileRenameFailureCleansTmp(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "occupied")
+	if err := os.Mkdir(target, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicWriteFile(target, []byte("x")); err == nil {
+		t.Fatal("expected error publishing onto an existing directory, got nil")
+	}
+	if _, err := os.Stat(target + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("staging file left behind after failed rename: %v", err)
+	}
 }
 
 // TestSyncDir smoke-checks the platform seam: on platforms with directory

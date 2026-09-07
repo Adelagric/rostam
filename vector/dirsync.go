@@ -44,6 +44,7 @@ func syncDir(dir string) error {
 // the directory ENTRY durable, the half temp+fsync+rename alone does not cover.
 func renameDurable(tmp, path string) error {
 	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp) // best-effort: don't leave the fsync'd staging file behind
 		return err
 	}
 	if err := syncDir(filepath.Dir(path)); err != nil {
