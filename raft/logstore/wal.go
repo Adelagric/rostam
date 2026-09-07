@@ -140,8 +140,13 @@ func (w *WAL) Close() error {
 			first = err
 		}
 	}
-	if len(w.segs) > 0 && first == nil {
-		if err := w.syncDir(); err != nil {
+	// Always attempt the directory sync, even after a segment fsync failure:
+	// in sync=false mode the directory entries of segments that DID sync were
+	// never made durable during operation, so skipping this on an unrelated
+	// segment's failure could lose whole healthy segments to recovery. Keep the
+	// FIRST error for the return value.
+	if len(w.segs) > 0 {
+		if err := w.syncDir(); err != nil && first == nil {
 			first = err
 		}
 	}
