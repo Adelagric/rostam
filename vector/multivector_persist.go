@@ -151,7 +151,7 @@ func (m *MultiVectorIndex) writeMapsSidecar() error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, m.mapsPath)
+	return renameDurable(tmp, m.mapsPath)
 }
 
 func (m *MultiVectorIndex) encodeMaps(w io.Writer) error {

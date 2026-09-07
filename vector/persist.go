@@ -172,7 +172,7 @@ func (h *hnsw) SavePersist(metaPath string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, metaPath) // atomic publish
+	return renameDurable(tmp, metaPath) // atomic publish (rename + dir fsync)
 }
 
 // writeMeta serializes the sidecar: header + per-slot ids/levels/level0Len +

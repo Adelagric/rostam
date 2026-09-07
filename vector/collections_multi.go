@@ -330,7 +330,9 @@ func (s *CollectionStore) writeMVWALSnapshotFile(idx *MultiVectorIndex, path str
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	// rename + parent-dir fsync: the MV Flush truncates the WAL on the
+	// strength of this checkpoint (see writeSnapshotFile in collections.go).
+	return renameDurable(tmp, path)
 }
 
 // DropMultiVector removes the named index, frees it, and deletes its files.
@@ -779,11 +781,7 @@ func writeMVConfig(path string, cfg MultiVectorConfig) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return atomicWriteFile(path, b)
 }
 
 func readMVConfig(path string) (MultiVectorConfig, error) {

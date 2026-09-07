@@ -228,7 +228,9 @@ func (s *CollectionStore) writeNamedSnapshotFile(nc *NamedCollection, path strin
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	// rename + parent-dir fsync: the named Flush truncates the WAL on the
+	// strength of this checkpoint (see writeSnapshotFile in collections.go).
+	return renameDurable(tmp, path)
 }
 
 // writeNamedConfig writes the named config marker (spaces + WAL flags) atomically
@@ -239,11 +241,7 @@ func writeNamedConfig(path string, cfg NamedConfig) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return atomicWriteFile(path, b)
 }
 
 // readNamedConfig reads a named config marker.

@@ -857,7 +857,12 @@ func (s *CollectionStore) writeSnapshotFile(c *Collection, path string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	// renameDurable (rename + parent-dir fsync), NOT a bare os.Rename: Flush
+	// truncates the WAL on the strength of this checkpoint. Without the dir
+	// fsync the truncate (itself fsync'd) can reach disk BEFORE the rename's
+	// directory entry — a crash in that window reopens on the OLD checkpoint
+	// with an EMPTY log, silently dropping the whole inter-checkpoint delta.
+	return renameDurable(tmp, path)
 }
 
 // Insert inserts a vector with the given TTL, metadata, and sparse vector into
@@ -1456,9 +1461,5 @@ func writeConfig(path string, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return atomicWriteFile(path, data)
 }

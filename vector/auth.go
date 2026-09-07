@@ -289,9 +289,5 @@ func (r *KeyRegistry) flushLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := r.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, r.path)
+	return atomicWriteFile(r.path, data)
 }
