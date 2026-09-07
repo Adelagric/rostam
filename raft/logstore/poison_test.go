@@ -84,6 +84,15 @@ func TestStableFsyncFailurePoisons(t *testing.T) {
 	if err := w.StoreLog(mkLog(1, "a")); !errors.Is(err, ErrWALPoisoned) {
 		t.Fatalf("StoreLogs after stable fsync failure: want ErrWALPoisoned, got %v", err)
 	}
+	// Reads of the stable store are gated too: Set mutated the in-memory map
+	// before the failed persist, so serving it would hand raft a term/vote no
+	// reopen will reproduce (unlike GetLog, which fails loud via CRC on its own).
+	if _, err := w.Get([]byte("votedFor")); !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("Get after stable fsync failure: want ErrWALPoisoned, got %v", err)
+	}
+	if _, err := w.GetUint64([]byte("term")); !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("GetUint64 after stable fsync failure: want ErrWALPoisoned, got %v", err)
+	}
 }
 
 // TestPoisonClearsOnReopen pins the ONLY sanctioned recovery: a fresh OpenWAL.
@@ -121,9 +130,10 @@ func TestPoisonClearsOnReopen(t *testing.T) {
 	}
 }
 
-// TestNoSyncModeNeverPoisonsOnStoreLogs pins the sync=false posture: StoreLogs
-// runs no fsync there, so the latch has nothing to trip on the log path and the
-// documented durability-from-replication contract is unchanged.
+// TestNoSyncModeNeverPoisonsOnStoreLogs pins the sync=false LOG posture:
+// StoreLogs runs no fsync there, so the latch has nothing to trip on the log
+// path and the documented durability-from-replication contract is unchanged.
+// Only the log path is latch-free in this mode — see the stable-path test below.
 func TestNoSyncModeNeverPoisonsOnStoreLogs(t *testing.T) {
 	dir := t.TempDir()
 	w, err := OpenWAL(dir, false)
@@ -134,5 +144,26 @@ func TestNoSyncModeNeverPoisonsOnStoreLogs(t *testing.T) {
 	w.fsyncf = func(*os.File) error { return errBoom } // would fail if ever called on this path
 	if err := w.StoreLog(mkLog(1, "a")); err != nil {
 		t.Fatalf("nosync StoreLogs must not fsync: %v", err)
+	}
+}
+
+// TestNoSyncModeStillPoisonsOnStablePath pins that sync=false does NOT exempt
+// the stable store (currentTerm/votedFor) or the compaction floor: those are
+// durable-unconditionally by design (see writeStableLocked — a granted vote must
+// survive a crash in EVERY mode, or the node can double-vote), so the fsyncgate
+// hazard and its latch apply there in every mode too.
+func TestNoSyncModeStillPoisonsOnStablePath(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWAL(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	failNextFsync(w)
+	if err := w.Set([]byte("votedFor"), []byte("n1")); !errors.Is(err, errBoom) {
+		t.Fatalf("expected injected fsync error, got %v", err)
+	}
+	if err := w.StoreLog(mkLog(1, "a")); !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("nosync StoreLogs after stable fsync failure: want ErrWALPoisoned, got %v", err)
 	}
 }

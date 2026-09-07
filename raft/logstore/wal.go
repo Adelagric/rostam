@@ -637,6 +637,14 @@ func (w *WAL) Set(key, val []byte) error {
 func (w *WAL) Get(key []byte) ([]byte, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// Poison gate on READS too, unlike the log path (whose GetLog fails loud via
+	// the per-record CRC when the kernel dropped pages). The stable map is served
+	// from MEMORY, and Set mutates the map before persisting — so after a failed
+	// stable fsync the map can hold a term/vote that no reopen will reproduce.
+	// Serving it would let raft act on a never-durable vote; fail closed instead.
+	if w.poisoned {
+		return nil, ErrWALPoisoned
+	}
 	v, ok := w.kv[string(key)]
 	if !ok {
 		return nil, nil
