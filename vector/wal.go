@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -115,6 +116,26 @@ type wal struct {
 	syncedSeq uint64 // highest writeSeq covered by a completed Sync (or truncate)
 	syncing   bool   // a leader is currently running f.Sync()
 
+	// poisoned is a TERMINAL latch tripped on the FIRST f.Sync() failure (in
+	// commitWait or truncate). It exists because of fsyncgate: on a failed
+	// fsync, the kernel may DISCARD the sync's dirty pages, and a SUBSEQUENT
+	// f.Sync() on the same file can then return SUCCESS having synced nothing
+	// (the post-4.13 Linux behavior; the PostgreSQL PANIC-on-fsync-failure
+	// case). If the next writer became fsync leader and retried Sync() after a
+	// failure, it could be acked on bytes the kernel already dropped — silently
+	// breaking the ack-implies-fsynced invariant this file's doc promises.
+	//
+	// So the WAL fails CLOSED: once poisoned, every append/commit-wait entry
+	// point returns ErrWALPoisoned rather than a false success, and no writer is
+	// ever allowed to retry the failed Sync. It is cleared ONLY by a fresh
+	// reopen (openWAL constructs a new struct → zero-value false), because only
+	// a new file handle re-establishes a known-good durability path; a
+	// truncate() that happens to Sync() successfully does NOT clear it (the
+	// underlying device may still be bad — see truncate). Set once under the
+	// leader's post-Sync syncMu; read lock-free via atomic so the hot append
+	// path gates cheaply. Mirrors arena.poisoned's terminal-latch discipline.
+	poisoned atomic.Bool
+
 	// Test hooks (nil in production). onSync runs under syncMu just before the
 	// post-Sync broadcast (counts completed Sync/truncate flushes — group-commit
 	// observability). beforeSync runs in the leader AFTER target is captured and
@@ -124,8 +145,17 @@ type wal struct {
 	beforeSync func()
 }
 
+// ErrWALPoisoned is returned by every append/commit-wait entry point once the
+// WAL has been poisoned by a prior f.Sync() failure (fsyncgate — see the
+// poisoned field). The WAL accepts no further writes or acks until it is
+// reopened; the caller must surface this so a delete/insert is reported failed
+// rather than falsely acked on bytes that may never have reached disk.
+var ErrWALPoisoned = errors.New("vector: wal poisoned by a prior fsync failure")
+
 // openWAL opens (creating if absent) the WAL at path for appending. Replay the
-// existing contents with replayWAL BEFORE calling this if recovering.
+// existing contents with replayWAL BEFORE calling this if recovering. The
+// returned wal starts UN-poisoned (zero-value latch) — a fresh open is the only
+// way a poisoned WAL recovers (see the poisoned field).
 func openWAL(path string, noSync bool) (*wal, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600) //nolint:gosec // caller-supplied path
 	if err != nil {
@@ -317,11 +347,21 @@ func (w *wal) appendDeleteStaged(id uint64) (uint64, error) {
 // in order to exercise leader-fsync batching (wal_group_commit_test.go). Do NOT
 // call it from production code; use the staged pair.
 func (w *wal) appendFramed(payload []byte) error {
+	if w.poisoned.Load() {
+		return ErrWALPoisoned // fast fail-closed: a prior fsync failure poisoned the log.
+	}
 	// WRITE phase: under mu, append the framed record and assign this writer's
 	// commit sequence (the post-write writeSeq). mu is released BEFORE the fsync so
 	// a concurrent appender can overlap this writer's commit-wait, and a leader's
 	// f.Sync() never holds mu.
 	w.mu.Lock()
+	// AUTHORITATIVE fail-closed re-check under w.mu (see appendFramedStaged): a
+	// leader may have poisoned the WAL after the early check above; never write a
+	// new record into a poisoned log.
+	if w.poisoned.Load() {
+		w.mu.Unlock()
+		return ErrWALPoisoned
+	}
 	var hdr [8]byte
 	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(payload))) //nolint:gosec
 	binary.BigEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(payload))
@@ -363,7 +403,28 @@ func (w *wal) appendFramed(payload []byte) error {
 // concurrent writers' commit-waits overlap and the leader-fsync actually
 // batches them.
 func (w *wal) appendFramedStaged(payload []byte) (uint64, error) {
+	if w.poisoned.Load() {
+		return 0, ErrWALPoisoned // fast fail-closed: a prior fsync failure poisoned the log.
+	}
 	w.mu.Lock()
+	// AUTHORITATIVE fail-closed check, under w.mu: a sync leader can poison the WAL
+	// (in commitWait) between the early check above and here. Re-check before
+	// writing ANY bytes so a poisoned WAL never appends a new record.
+	//
+	// This does NOT close the window where a write's bytes are appended while an
+	// in-flight leader Sync (running under NEITHER lock — that overlap is the whole
+	// point of group commit) then fails and poisons: such a writer's commitWait
+	// returns ErrWALPoisoned, so it is NEVER acked, but its bytes are already in the
+	// file and may replay on reopen. That is intended at-least-once semantics for an
+	// errored/in-flight write — identical to a crash mid-append — NOT a false ack.
+	// Durability is promised only for a write that returned nil: syncedSeq advances
+	// solely after a SUCCESSFUL Sync (see commitWait), so no errored write is ever
+	// acknowledged. Closing this residual would require serializing appends through
+	// f.Sync(), which would destroy group commit.
+	if w.poisoned.Load() {
+		w.mu.Unlock()
+		return 0, ErrWALPoisoned
+	}
 	var hdr [8]byte
 	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(payload))) //nolint:gosec
 	binary.BigEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(payload))
@@ -388,6 +449,9 @@ func (w *wal) appendFramedStaged(payload []byte) (uint64, error) {
 // own noSync short-circuit), so waiting on syncedSeq would block forever.
 // Staged callers use this instead of calling commitWait directly.
 func (w *wal) commitWaitStaged(seq uint64) error {
+	if seq == 0 {
+		return nil // nothing was staged (e.g. a no-op delete) — a success, even poisoned.
+	}
 	if w.noSync {
 		return nil
 	}
@@ -400,8 +464,21 @@ func (w *wal) commitWaitStaged(seq uint64) error {
 // flight (those whose bytes it covers) or wait for the next flight. f.Sync() runs
 // holding NEITHER mu NOR syncMu so writes overlap the in-flight fsync.
 func (w *wal) commitWait(seq uint64) error {
+	if seq == 0 {
+		// A no-op write (nothing staged) touches no durability, so it stays a
+		// success even on a poisoned WAL — this fast path MUST precede the poison
+		// gate so a no-op delete of an absent id is not turned into ErrWALPoisoned.
+		return nil
+	}
 	w.syncMu.Lock()
 	for {
+		if w.poisoned.Load() {
+			// Fail closed: a prior fsync failed and may have dropped its dirty
+			// pages. Do NOT retry Sync() (a retry can falsely succeed) and do NOT
+			// ack. A follower woken by the poisoning leader's broadcast lands here.
+			w.syncMu.Unlock()
+			return ErrWALPoisoned
+		}
 		if w.syncedSeq >= seq {
 			w.syncMu.Unlock() // a completed Sync already covered our bytes.
 			return nil
@@ -429,7 +506,13 @@ func (w *wal) commitWait(seq uint64) error {
 
 		w.syncMu.Lock()
 		w.syncing = false
-		if err == nil && target > w.syncedSeq {
+		if err != nil {
+			// fsyncgate: poison BEFORE returning (and before the broadcast, so every
+			// woken waiter observes the latch) — a failed fsync may have dropped its
+			// dirty pages, and a follower retrying Sync() could then be acked on bytes
+			// that are gone. Fail closed; only a reopen recovers.
+			w.poisoned.Store(true)
+		} else if target > w.syncedSeq {
 			w.syncedSeq = target
 		}
 		if w.onSync != nil {
@@ -454,15 +537,41 @@ func (w *wal) commitWait(seq uint64) error {
 func (w *wal) truncate() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// A failure at ANY step of a rotation (truncate/seek/sync) leaves the log's
+	// durability state unknown, and — like commitWait — a later writer must never
+	// be allowed to retry an fsync that could falsely succeed after the kernel
+	// dropped a prior failure's dirty pages (fsyncgate). Fail closed on any error.
+	//
+	// Best-effort fast-fail if the WAL is ALREADY poisoned: skip a pointless
+	// rotation of a known-dead log. This is NOT a full barrier — poison is set
+	// under syncMu (in commitWait) while this checks under w.mu, so a leader Sync
+	// failing between here and truncate's own Sync below can still let one truncate
+	// Sync through. That is harmless: a failed truncate Sync itself poisons and
+	// never advances syncedSeq, and poisoned waiters hit the poison gate before the
+	// syncedSeq check, so no errored write is ever acked. (In practice Flush holds
+	// the caller's opMu across snapshot+truncate, so no concurrent writer op runs
+	// here at all — see the truncate doc comment above.)
+	if w.poisoned.Load() {
+		return ErrWALPoisoned
+	}
 	if err := w.f.Truncate(0); err != nil {
+		w.poisoned.Store(true)
 		return err
 	}
 	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
+		w.poisoned.Store(true)
 		return err
 	}
 	if err := w.f.Sync(); err != nil {
+		w.poisoned.Store(true)
 		return err
 	}
+	// NOTE: a SUCCESSFUL truncate+Sync does NOT clear a pre-existing poison. A
+	// clean rotation only proves this one Sync returned success — on post-4.13
+	// Linux that can happen after the kernel already discarded a prior failure's
+	// dirty pages, so "truncate succeeded" is not evidence the device is healthy.
+	// Poison is therefore cleared ONLY by a fresh reopen (openWAL), which
+	// re-establishes a new file handle and a known durability path.
 	w.syncMu.Lock()
 	if w.writeSeq > w.syncedSeq {
 		w.syncedSeq = w.writeSeq
