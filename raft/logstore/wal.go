@@ -4,6 +4,7 @@ package logstore
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"log/slog"
@@ -44,6 +45,22 @@ type recPos struct {
 	size   int // total record bytes: frameHdr + payload
 }
 
+// ErrWALPoisoned marks a WAL whose ack-implies-durable contract can no longer be
+// trusted: an earlier fsync (segment, directory, or durable-file write) FAILED,
+// and on post-4.13 Linux the kernel may have DISCARDED that sync's dirty pages —
+// a subsequent fsync on the same file can then return SUCCESS having synced
+// nothing (the fsyncgate / PostgreSQL PANIC-on-fsync-failure case). If a later
+// StoreLogs or stable-store Set simply retried, the node would ack raft entries
+// (or persist a vote) on bytes that are gone, silently counting toward commit
+// quorum on data no crash recovery can produce. So the WAL fails CLOSED: the
+// first fsync failure trips a terminal latch and every subsequent write entry
+// point returns this error. Reads stay open — a read of dropped pages already
+// fails loud via the per-record CRC. The latch clears ONLY on a fresh OpenWAL:
+// a later fsync that happens to succeed is no proof the device recovered.
+// Mirrors vector/wal.go's poisoned latch (the #87 fix), adapted to this store's
+// single-mutex model.
+var ErrWALPoisoned = errors.New("logstore: WAL poisoned by an earlier fsync failure; reopen required")
+
 // WAL is a durable raft LogStore + StableStore: a segmented append-only log with
 // an in-memory offset index and a fixed binary record format (codec.go), fsync'd
 // per StoreLogs batch. It replaces raft-boltdb for the durable path.
@@ -59,6 +76,22 @@ type WAL struct {
 	offsets []recPos   // offsets[i] locates entry (first + i)
 	maxSeg  int64
 	sync    bool // fsync per StoreLogs batch (durable) vs page-cache only (fast)
+
+	// poisoned is the terminal fail-closed latch (see ErrWALPoisoned). Guarded by
+	// mu like everything else; set at the point an fsync failure is observed,
+	// before the error is returned, so no later write can slip past it.
+	poisoned bool
+
+	// fsyncf is the file-sync seam: production is (*os.File).Sync; tests inject a
+	// failing implementation to exercise the poison latch deterministically. It
+	// covers every durability-bearing sync (segments, the directory handle, and
+	// writeFileDurable's temp file).
+	//
+	// Contract: set it once, before the WAL's first use (right after OpenWAL) and
+	// never concurrently with an in-flight operation. It is READ under mu on the
+	// write paths but tests replace it without holding mu, which is only safe
+	// while the WAL is idle.
+	fsyncf func(*os.File) error
 
 	encBuf  []byte // reused StoreLogs encode buffer (zero-alloc hot path)
 	readBuf []byte // reused GetLog read buffer
@@ -86,6 +119,7 @@ func OpenWAL(dir string, sync bool) (*WAL, error) {
 		sync:       sync,
 		stablePath: filepath.Join(dir, "stable"),
 		kv:         make(map[string][]byte, 8),
+		fsyncf:     (*os.File).Sync,
 	}
 	if err := w.recover(); err != nil {
 		return nil, err
@@ -106,12 +140,18 @@ func (w *WAL) Close() error {
 	// segments were never fsynced during operation) plus the directory, so a
 	// clean shutdown is durable for the whole log.
 	for _, s := range w.segs {
-		if err := s.f.Sync(); err != nil && first == nil {
+		if err := w.fsyncf(s.f); err != nil && first == nil {
+			w.poisoned = true // a reopened handle must not trust a later false-success sync
 			first = err
 		}
 	}
-	if len(w.segs) > 0 && first == nil {
-		if err := w.syncDir(); err != nil {
+	// Always attempt the directory sync, even after a segment fsync failure:
+	// in sync=false mode the directory entries of segments that DID sync were
+	// never made durable during operation, so skipping this on an unrelated
+	// segment's failure could lose whole healthy segments to recovery. Keep the
+	// FIRST error for the return value.
+	if len(w.segs) > 0 {
+		if err := w.syncDir(); err != nil && first == nil {
 			first = err
 		}
 	}
@@ -181,6 +221,9 @@ func (w *WAL) StoreLogs(logs []*hraft.Log) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.poisoned {
+		return ErrWALPoisoned
+	}
 	preLen := len(w.segs)
 	var preActive *segment
 	if preLen > 0 {
@@ -199,7 +242,8 @@ func (w *WAL) StoreLogs(logs []*hraft.Log) error {
 	// before the batch is acknowledged. Unchanged segments have no dirty pages,
 	// so their fsync is a near-free no-op.
 	for _, s := range w.segs {
-		if err := s.f.Sync(); err != nil {
+		if err := w.fsyncf(s.f); err != nil {
+			w.poisoned = true // fail closed: see ErrWALPoisoned
 			return fmt.Errorf("logstore: fsync segment: %w", err)
 		}
 	}
@@ -272,6 +316,9 @@ func (w *WAL) addSegmentLocked(base uint64) error {
 func (w *WAL) DeleteRange(minIdx, maxIdx uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.poisoned {
+		return ErrWALPoisoned
+	}
 	if len(w.offsets) == 0 {
 		return nil
 	}
@@ -361,7 +408,8 @@ func (w *WAL) truncateTailLocked(newFirstRemoved uint64) error {
 	// cannot leave a removed higher-base segment on disk for recovery to
 	// resurrect as live (its records would collide with the re-appended tail).
 	if w.sync {
-		if err := seg.f.Sync(); err != nil {
+		if err := w.fsyncf(seg.f); err != nil {
+			w.poisoned = true // fail closed: see ErrWALPoisoned
 			return fmt.Errorf("logstore: fsync truncated segment: %w", err)
 		}
 		if removed {
@@ -401,12 +449,21 @@ func (w *WAL) floorPath() string { return filepath.Join(w.dir, "first") }
 // syncDir fsyncs the WAL directory. fsync of a file does NOT make its directory
 // entry durable, so a create/rename/remove must be followed by a directory sync
 // for the name change to survive a power loss.
+//
+// Failing to OPEN the directory is as terminal as failing to sync it, and is
+// latched the same way: every caller has already performed the name change the
+// sync was meant to make durable. truncateTailLocked is the sharp case — it has
+// removed the segments holding a conflicting tail, and leaving the store
+// un-poisoned would ack the next batch while a crash could still resurrect
+// those segments and collide with the re-appended entries.
 func (w *WAL) syncDir() error {
 	d, err := os.Open(w.dir)
 	if err != nil {
+		w.poisoned = true // fail closed: see ErrWALPoisoned
 		return fmt.Errorf("logstore: open dir: %w", err)
 	}
-	if err := d.Sync(); err != nil {
+	if err := w.fsyncf(d); err != nil {
+		w.poisoned = true // fail closed: see ErrWALPoisoned
 		_ = d.Close()
 		return fmt.Errorf("logstore: sync dir: %w", err)
 	}
@@ -417,7 +474,27 @@ func (w *WAL) syncDir() error {
 // fsynced, renamed into place, and the directory is fsynced. Used for the stable
 // store and the compaction floor, which must be durable regardless of the log's
 // sync mode.
-func (w *WAL) writeFileDurable(path string, data []byte) error {
+//
+// ANY failure here is TERMINAL and trips the poison latch, not just a failing
+// fsync. Every caller mutates in-memory state BEFORE persisting it — Set writes
+// w.kv, truncateFrontLocked advances w.first — so a create, write, close,
+// rename or directory-sync failure leaves memory ahead of disk exactly like a
+// failed fsync does. Without the latch the read gate would keep serving a
+// term/vote (or a compaction floor) that no reopen can reproduce: ENOSPC on the
+// staging write, an EIO surfaced by the deferred writeback in Close, or a failed
+// rename all leave the old file in place while the map claims the new value.
+// Restoring the pre-call value instead would have to be exact for every caller;
+// poisoning is one uniform contract that cannot be got wrong, and matches the
+// fail-closed posture the rest of the store already takes.
+//
+// Callers hold w.mu, so the latch is set under the same mutex discipline as the
+// fsync branches.
+func (w *WAL) writeFileDurable(path string, data []byte) (err error) {
+	defer func() {
+		if err != nil {
+			w.poisoned = true // fail closed on EVERY path: see ErrWALPoisoned
+		}
+	}()
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -427,7 +504,7 @@ func (w *WAL) writeFileDurable(path string, data []byte) error {
 		_ = f.Close()
 		return fmt.Errorf("logstore: write %s: %w", tmp, err)
 	}
-	if err := f.Sync(); err != nil {
+	if err := w.fsyncf(f); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("logstore: fsync %s: %w", tmp, err)
 	}
@@ -587,6 +664,9 @@ func (s *segment) truncateAt(off int64) error {
 func (w *WAL) Set(key, val []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.poisoned {
+		return ErrWALPoisoned
+	}
 	w.kv[string(key)] = append([]byte(nil), val...)
 	return w.writeStableLocked()
 }
@@ -594,6 +674,14 @@ func (w *WAL) Set(key, val []byte) error {
 func (w *WAL) Get(key []byte) ([]byte, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// Poison gate on READS too, unlike the log path (whose GetLog fails loud via
+	// the per-record CRC when the kernel dropped pages). The stable map is served
+	// from MEMORY, and Set mutates the map before persisting — so after a failed
+	// stable fsync the map can hold a term/vote that no reopen will reproduce.
+	// Serving it would let raft act on a never-durable vote; fail closed instead.
+	if w.poisoned {
+		return nil, ErrWALPoisoned
+	}
 	v, ok := w.kv[string(key)]
 	if !ok {
 		return nil, nil
