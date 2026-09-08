@@ -361,14 +361,18 @@ func TestWriteFloorFsyncFailurePoisons(t *testing.T) {
 }
 
 // TestDirOpenFailurePoisons covers syncDir's OPEN failure, which four callers
-// reach without passing through writeFileDurable's defer. The sharp case is the
-// one exercised here: truncateTailLocked has already closed and removed the
-// segments holding a conflicting tail, so an unlatched store would ack the next
-// batch while a crash could still resurrect those segments and collide with the
-// re-appended entries.
+// reach without passing through writeFileDurable's defer. It is driven through
+// truncateTailLocked because that caller is the sharp one in production: it has
+// closed and removed the segments holding a conflicting tail, so an unlatched
+// store would ack the next batch while a crash could still resurrect those
+// segments and collide with the re-appended entries.
 //
 // The open failure is injected by dropping the directory's permissions, which
-// root ignores — hence the skip.
+// root ignores — hence the skip. NOTE the same permission bits also block the
+// unlink (os.Remove needs w+x on the directory, and truncateTailLocked discards
+// its error), so under THIS injection the segment file actually stays on disk:
+// the test pins the poison-on-open-failure latch for this call path, not the
+// removed-then-unresolvable state itself, which no permission trick can create.
 func TestDirOpenFailurePoisons(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses directory permission checks")
@@ -395,8 +399,11 @@ func TestDirOpenFailurePoisons(t *testing.T) {
 	if err := os.Chmod(dir, 0o000); err != nil {
 		t.Fatal(err)
 	}
-	// Drops entries 2 and 3: segment 3 is removed, then the directory sync that
-	// should make the removal durable cannot even open the directory.
+	// Drops entries 2 and 3: the tail truncation runs (the in-memory index and
+	// the fd truncate need no directory permission), then the directory sync that
+	// should make the segment removal durable cannot even open the directory.
+	// (The unlink itself is also blocked by the 0o000 bits and its error is
+	// discarded — see the doc comment above.)
 	err = w.DeleteRange(2, 3)
 	if err == nil || !strings.Contains(err.Error(), "open dir") {
 		t.Fatalf("want the directory open failure, got %v", err)
