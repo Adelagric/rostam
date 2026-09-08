@@ -45,13 +45,6 @@ type recPos struct {
 	size   int // total record bytes: frameHdr + payload
 }
 
-// WAL is a durable raft LogStore + StableStore: a segmented append-only log with
-// an in-memory offset index and a fixed binary record format (codec.go), fsync'd
-// per StoreLogs batch. It replaces raft-boltdb for the durable path.
-//
-// Concurrency: one mutex guards everything. raft serializes StoreLogs on the
-// leader and reads via replication goroutines; a single lock keeps the index and
-// files consistent, matching bbolt's single-writer model.
 // ErrWALPoisoned marks a WAL whose ack-implies-durable contract can no longer be
 // trusted: an earlier fsync (segment, directory, or durable-file write) FAILED,
 // and on post-4.13 Linux the kernel may have DISCARDED that sync's dirty pages —
@@ -68,6 +61,13 @@ type recPos struct {
 // single-mutex model.
 var ErrWALPoisoned = errors.New("logstore: WAL poisoned by an earlier fsync failure; reopen required")
 
+// WAL is a durable raft LogStore + StableStore: a segmented append-only log with
+// an in-memory offset index and a fixed binary record format (codec.go), fsync'd
+// per StoreLogs batch. It replaces raft-boltdb for the durable path.
+//
+// Concurrency: one mutex guards everything. raft serializes StoreLogs on the
+// leader and reads via replication goroutines; a single lock keeps the index and
+// files consistent, matching bbolt's single-writer model.
 type WAL struct {
 	mu      sync.Mutex
 	dir     string
@@ -86,6 +86,11 @@ type WAL struct {
 	// failing implementation to exercise the poison latch deterministically. It
 	// covers every durability-bearing sync (segments, the directory handle, and
 	// writeFileDurable's temp file).
+	//
+	// Contract: set it once, before the WAL's first use (right after OpenWAL) and
+	// never concurrently with an in-flight operation. It is READ under mu on the
+	// write paths but tests replace it without holding mu, which is only safe
+	// while the WAL is idle.
 	fsyncf func(*os.File) error
 
 	encBuf  []byte // reused StoreLogs encode buffer (zero-alloc hot path)
@@ -461,7 +466,27 @@ func (w *WAL) syncDir() error {
 // fsynced, renamed into place, and the directory is fsynced. Used for the stable
 // store and the compaction floor, which must be durable regardless of the log's
 // sync mode.
-func (w *WAL) writeFileDurable(path string, data []byte) error {
+//
+// ANY failure here is TERMINAL and trips the poison latch, not just a failing
+// fsync. Every caller mutates in-memory state BEFORE persisting it — Set writes
+// w.kv, truncateFrontLocked advances w.first — so a create, write, close,
+// rename or directory-sync failure leaves memory ahead of disk exactly like a
+// failed fsync does. Without the latch the read gate would keep serving a
+// term/vote (or a compaction floor) that no reopen can reproduce: ENOSPC on the
+// staging write, an EIO surfaced by the deferred writeback in Close, or a failed
+// rename all leave the old file in place while the map claims the new value.
+// Restoring the pre-call value instead would have to be exact for every caller;
+// poisoning is one uniform contract that cannot be got wrong, and matches the
+// fail-closed posture the rest of the store already takes.
+//
+// Callers hold w.mu, so the latch is set under the same mutex discipline as the
+// fsync branches.
+func (w *WAL) writeFileDurable(path string, data []byte) (err error) {
+	defer func() {
+		if err != nil {
+			w.poisoned = true // fail closed on EVERY path: see ErrWALPoisoned
+		}
+	}()
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -472,7 +497,6 @@ func (w *WAL) writeFileDurable(path string, data []byte) error {
 		return fmt.Errorf("logstore: write %s: %w", tmp, err)
 	}
 	if err := w.fsyncf(f); err != nil {
-		w.poisoned = true // fail closed: see ErrWALPoisoned
 		_ = f.Close()
 		return fmt.Errorf("logstore: fsync %s: %w", tmp, err)
 	}

@@ -5,6 +5,8 @@ package logstore
 import (
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	hraft "github.com/hashicorp/raft"
@@ -18,13 +20,50 @@ import (
 var errBoom = errors.New("injected fsync failure")
 
 func failNextFsync(w *WAL) {
+	failFsyncIf(w, func(*os.File) bool { return true })
+}
+
+// failFsyncIf arms the seam to fail exactly once with errBoom, on the first sync
+// whose target matches want; every other sync (and everything after the failure)
+// runs the real (*os.File).Sync. Selecting the target by predicate rather than by
+// call count keeps the latch-site tests independent of how many incidental syncs
+// a path performs. Per the fsyncf contract, arm it only while the WAL is idle.
+func failFsyncIf(w *WAL, want func(*os.File) bool) {
 	fired := false
 	w.fsyncf = func(f *os.File) error {
-		if fired {
+		if fired || !want(f) {
 			return (*os.File).Sync(f)
 		}
 		fired = true
 		return errBoom
+	}
+}
+
+// isDirHandle matches the directory handle syncDir opens, so a test can fail the
+// directory fsync while letting the segment fsyncs ahead of it succeed.
+func isDirHandle(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.IsDir()
+}
+
+// assertFailClosed pins the post-latch contract: every write entry point and the
+// gated stable-store read return ErrWALPoisoned.
+func assertFailClosed(t *testing.T, w *WAL, next uint64) {
+	t.Helper()
+	if !w.poisoned {
+		t.Fatal("latch not tripped")
+	}
+	if err := w.StoreLog(mkLog(next, "after")); !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("StoreLogs: want ErrWALPoisoned, got %v", err)
+	}
+	if err := w.SetUint64([]byte("term"), 9); !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("Set: want ErrWALPoisoned, got %v", err)
+	}
+	if _, err := w.Get([]byte("votedFor")); !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("Get: want ErrWALPoisoned, got %v", err)
+	}
+	if err := w.DeleteRange(1, 1); !errors.Is(err, ErrWALPoisoned) {
+		t.Fatalf("DeleteRange: want ErrWALPoisoned, got %v", err)
 	}
 }
 
@@ -166,4 +205,157 @@ func TestNoSyncModeStillPoisonsOnStablePath(t *testing.T) {
 	if err := w.StoreLog(mkLog(1, "a")); !errors.Is(err, ErrWALPoisoned) {
 		t.Fatalf("nosync StoreLogs after stable fsync failure: want ErrWALPoisoned, got %v", err)
 	}
+}
+
+// TestStableNonFsyncFailurePoisons pins the widened contract: a durable write
+// that fails ANYWHERE — not only at the fsync — is terminal. Set mutates w.kv
+// before persisting, so a failed create (ENOSPC/ENOTDIR on the staging file) or
+// a failed rename leaves the in-memory map holding a term/vote that is not on
+// disk and that no reopen will reproduce. Without the latch the read gate would
+// happily serve it. Both cases are driven through the real filesystem rather
+// than the fsync seam, which by construction cannot reach these paths.
+func TestStableNonFsyncFailurePoisons(t *testing.T) {
+	cases := []struct {
+		name string
+		// stable returns the stable-store path to point the WAL at, having
+		// created whatever makes the durable write fail.
+		stable func(t *testing.T, dir string) string
+		// wantStage is the stage of writeFileDurable expected to fail.
+		wantStage string
+	}{
+		{
+			name: "staging create fails",
+			stable: func(t *testing.T, dir string) string {
+				blocker := filepath.Join(dir, "blocker")
+				if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return filepath.Join(blocker, "stable") // parent is a FILE => ENOTDIR
+			},
+			wantStage: "create",
+		},
+		{
+			name: "rename fails",
+			stable: func(t *testing.T, dir string) string {
+				target := filepath.Join(dir, "stable-as-dir")
+				if err := os.Mkdir(target, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				return target // renaming a file onto a directory => EISDIR
+			},
+			wantStage: "rename",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			w, err := OpenWAL(dir, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.stablePath = tc.stable(t, dir)
+
+			err = w.Set([]byte("votedFor"), []byte("n1"))
+			if err == nil {
+				t.Fatal("Set must surface the durable-write failure")
+			}
+			if errors.Is(err, ErrWALPoisoned) {
+				t.Fatalf("want the underlying cause, got the latch error: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantStage) {
+				t.Fatalf("want a %s failure, got %v", tc.wantStage, err)
+			}
+			assertFailClosed(t, w, 1)
+			if err := w.Close(); err != nil {
+				t.Fatalf("close poisoned: %v", err)
+			}
+
+			// The latch clears only on a fresh open, which is then fully usable.
+			w2, err := OpenWAL(dir, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = w2.Close() }()
+			if err := w2.Set([]byte("votedFor"), []byte("n1")); err != nil {
+				t.Fatalf("reopened WAL must accept Set: %v", err)
+			}
+			if err := w2.StoreLog(mkLog(1, "a")); err != nil {
+				t.Fatalf("reopened WAL must accept writes: %v", err)
+			}
+			if v, err := w2.Get([]byte("votedFor")); err != nil || string(v) != "n1" {
+				t.Fatalf("reopened Get: got %q err=%v", v, err)
+			}
+		})
+	}
+}
+
+// TestRotationDirSyncFailurePoisons covers the syncDir latch site: a batch that
+// rotates must make the NEW segment's directory entry durable, so a failing
+// directory fsync is as terminal as a failing segment fsync (recovery could
+// otherwise not find a segment whose records were acked).
+func TestRotationDirSyncFailurePoisons(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWAL(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	w.maxSeg = 1 // every append rotates
+
+	if err := w.StoreLog(mkLog(1, "a")); err != nil { // creates the first segment
+		t.Fatalf("seed: %v", err)
+	}
+	failFsyncIf(w, isDirHandle) // let the segment fsyncs through, fail the dir sync
+	err = w.StoreLog(mkLog(2, "b"))
+	if !errors.Is(err, errBoom) || !strings.Contains(err.Error(), "sync dir") {
+		t.Fatalf("want the injected dir-sync failure, got %v", err)
+	}
+	assertFailClosed(t, w, 3)
+}
+
+// TestTruncateTailFsyncFailurePoisons covers the truncateTailLocked latch site:
+// the conflict-truncation fsync is what stops a crash from resurrecting the
+// removed tail, so its failure must fail closed like any other.
+func TestTruncateTailFsyncFailurePoisons(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWAL(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	for i := uint64(1); i <= 3; i++ {
+		if err := w.StoreLog(mkLog(i, "a")); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+	failNextFsync(w) // the truncation fsync is the next sync on this path
+	err = w.DeleteRange(3, 3)
+	if !errors.Is(err, errBoom) || !strings.Contains(err.Error(), "truncated segment") {
+		t.Fatalf("want the injected truncate fsync failure, got %v", err)
+	}
+	assertFailClosed(t, w, 4)
+}
+
+// TestWriteFloorFsyncFailurePoisons covers the writeFloorLocked latch site: the
+// compaction floor is what makes recovery skip the dropped prefix, and
+// truncateFrontLocked advances w.first in memory before persisting it — so a
+// failed floor write leaves memory ahead of disk and must poison.
+func TestWriteFloorFsyncFailurePoisons(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWAL(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	for i := uint64(1); i <= 3; i++ {
+		if err := w.StoreLog(mkLog(i, "a")); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+	failNextFsync(w) // the floor file's fsync is the next sync on this path
+	err = w.DeleteRange(1, 1)
+	if !errors.Is(err, errBoom) || !strings.Contains(err.Error(), "first.tmp") {
+		t.Fatalf("want the injected floor fsync failure, got %v", err)
+	}
+	assertFailClosed(t, w, 4)
 }
