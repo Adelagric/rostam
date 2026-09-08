@@ -126,10 +126,22 @@ func DecodeRequest(frame []byte) (opName string, args []byte, err error) {
 	if nameLen > 0 {
 		opName = unsafe.String(&frame[1], nameLen)
 	}
-	argsLen := int(binary.BigEndian.Uint32(frame[1+nameLen : 1+nameLen+4]))
-	if argsLen > MaxFrameSize {
+	rawArgsLen := binary.BigEndian.Uint32(frame[1+nameLen : 1+nameLen+4])
+	// Reject on the TOTAL reconstructed frame size (header + args), computed
+	// in uint64 so nothing can overflow on any platform, matching the bound
+	// EncodeRequest panics on. Two things this guards against:
+	//   - the int conversion below: on 32-bit platforms (GOARCH=386/arm),
+	//     int is 32-bit and a raw length >= 2^31 would wrap negative,
+	//     defeating every bounds check that follows.
+	//   - a per-field-valid argsLen (<= MaxFrameSize) whose header+args
+	//     total still exceeds MaxFrameSize; EncodeRequest panics on that
+	//     total, so a decoder that accepted such a frame could panic later
+	//     on re-encode.
+	headerLen := uint64(1 + nameLen + 4) // <= 1+255+4, never overflows
+	if headerLen+uint64(rawArgsLen) > uint64(MaxFrameSize) {
 		return "", nil, ErrFrameTooLarge
 	}
+	argsLen := int(rawArgsLen)
 	if len(frame) < 1+nameLen+4+argsLen {
 		return "", nil, ErrFrameTruncated
 	}
@@ -155,10 +167,16 @@ func DecodeResponse(frame []byte) (status uint8, payload []byte, err error) {
 		return 0, nil, ErrFrameTruncated
 	}
 	status = frame[0]
-	payloadLen := int(binary.BigEndian.Uint32(frame[1:5]))
-	if payloadLen > MaxFrameSize {
+	rawPayloadLen := binary.BigEndian.Uint32(frame[1:5])
+	// Reject on the TOTAL reconstructed frame size (header + payload),
+	// computed in uint64 so nothing can overflow on any platform, matching
+	// the bound EncodeResponse panics on. See DecodeRequest for why both the
+	// int-conversion and total-size cases matter.
+	const headerLen = uint64(1 + 4)
+	if headerLen+uint64(rawPayloadLen) > uint64(MaxFrameSize) {
 		return 0, nil, ErrFrameTooLarge
 	}
+	payloadLen := int(rawPayloadLen)
 	if len(frame) < 5+payloadLen {
 		return 0, nil, ErrFrameTruncated
 	}
