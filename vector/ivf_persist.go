@@ -383,7 +383,7 @@ func (ix *ivf) savePersist(metaPath string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, metaPath) // atomic publish
+	return renameDurable(tmp, metaPath) // atomic publish (rename + dir fsync)
 }
 
 // openPersistIVF reopens an IVF index saved with SavePersist, mapping its vecs file

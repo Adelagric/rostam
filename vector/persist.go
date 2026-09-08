@@ -156,23 +156,31 @@ func (h *hnsw) SavePersist(metaPath string) error {
 	if err != nil {
 		return err
 	}
+	// Every failure below drops the staging file: an abandoned .tmp is dead weight
+	// next to the sidecar it never became, and a later save reuses the same fixed
+	// name. Matches the writers in collections.go / dirsync.go, and renameDurable
+	// covers the failed-rename case itself.
 	bw := bufio.NewWriterSize(f, 1<<16)
 	if err := h.writeMeta(bw, n); err != nil {
 		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := bw.Flush(); err != nil {
 		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, metaPath) // atomic publish
+	return renameDurable(tmp, metaPath) // atomic publish (rename + dir fsync)
 }
 
 // writeMeta serializes the sidecar: header + per-slot ids/levels/level0Len +
