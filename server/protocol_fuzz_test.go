@@ -23,7 +23,7 @@ func FuzzDecodeRequest(f *testing.F) {
 	f.Add([]byte{1, 'x', 0, 0, 0, 0})
 	f.Add(EncodeRequest("get", []byte("hello")))
 	f.Add(EncodeRequest("", nil))
-	f.Add([]byte{0xff}) // nameLen=255, truncated
+	f.Add([]byte{0xff})                                // nameLen=255, truncated
 	f.Add([]byte{2, 'o', 'p', 0xff, 0xff, 0xff, 0xff}) // huge argsLen
 
 	f.Fuzz(func(t *testing.T, frame []byte) {
