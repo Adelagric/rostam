@@ -156,6 +156,12 @@ func (s *CollectionStore) CreateMultiVector(name string, cfg MultiVectorConfig) 
 	if writeMarker {
 		if err := writeMVConfig(cfgPath, cfg); err != nil {
 			_ = idx.Close()
+			// The marker is the load-time source of truth (loadMultiVector rebuilds the
+			// index from it), and the durable publish can fail with the rename already
+			// landed — its parent-directory fsync runs after it. Creation is reporting
+			// failure and nothing is registered, so a surviving marker would resurrect
+			// an empty index on restart. Best-effort remove it.
+			_ = os.Remove(cfgPath)
 			return err
 		}
 	}

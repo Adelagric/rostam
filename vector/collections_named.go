@@ -117,6 +117,12 @@ func (s *CollectionStore) CreateNamedConfig(name string, cfg NamedConfig) error 
 		}
 		if err := writeNamedConfig(cfgPath, cfg); err != nil {
 			_ = nc.Close()
+			// The marker is the load-time source of truth (loadNamed rebuilds the
+			// collection from it), and the durable publish can fail with the rename
+			// already landed — its parent-directory fsync runs after it. Creation is
+			// reporting failure and nothing is registered, so a surviving marker would
+			// resurrect an empty collection on restart. Best-effort remove it.
+			_ = os.Remove(cfgPath)
 			return err
 		}
 		w, werr := openWAL(walPath, cfg.WALNoSync)

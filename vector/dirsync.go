@@ -38,6 +38,14 @@ func syncDir(dir string) error {
 	return serr
 }
 
+// syncDirf is the directory-fsync seam. Production always runs syncDir; tests
+// replace it to exercise the one window a real fsync failure opens — the rename
+// has LANDED but the publish reports failure — which is how a caller can be told
+// its write failed while the new bytes are already visible on disk. Mirrors the
+// fsyncf seam in raft/logstore. Not for concurrent use: a test swaps it in and
+// restores it around a single sequential call.
+var syncDirf = syncDir
+
 // renameDurable completes an atomic publish: rename tmp over path, then fsync
 // the parent directory so the rename survives a crash. The caller must already
 // have fsynced tmp's CONTENTS (directly, or via atomicWriteFile) — this makes
@@ -47,7 +55,7 @@ func renameDurable(tmp, path string) error {
 		_ = os.Remove(tmp) // best-effort: don't leave the fsync'd staging file behind
 		return err
 	}
-	if err := syncDir(filepath.Dir(path)); err != nil {
+	if err := syncDirf(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("vector: fsync dir %s: %w", filepath.Dir(path), err)
 	}
 	return nil

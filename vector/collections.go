@@ -499,6 +499,18 @@ func (s *CollectionStore) CreateCollection(name string, cfg Config) error {
 	}
 	c, err := s.buildCollection(canonical, cfg)
 	if err != nil {
+		// The config marker is the load-time source of truth: OpenCollectionStore
+		// rebuilds the catalog from it. buildCollection can fail AFTER the marker's
+		// rename has landed (the durable publish also fsyncs the parent directory,
+		// which can fail on its own), and it fails after writing the marker whenever
+		// the WAL cannot be opened. Either way the caller is told creation failed and
+		// nothing is registered in memory, so leaving the marker behind would let a
+		// restart resurrect the collection as an empty one. Best-effort remove it.
+		// Done here rather than inside buildCollection because the cold-tier promote
+		// path also builds through it, for a collection whose marker is a live
+		// catalog entry that must survive a failed promote.
+		cfgPath, _ := s.collectionPath(canonical)
+		_ = os.Remove(cfgPath)
 		return err
 	}
 	s.collections[canonical] = c
