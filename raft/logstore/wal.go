@@ -449,9 +449,17 @@ func (w *WAL) floorPath() string { return filepath.Join(w.dir, "first") }
 // syncDir fsyncs the WAL directory. fsync of a file does NOT make its directory
 // entry durable, so a create/rename/remove must be followed by a directory sync
 // for the name change to survive a power loss.
+//
+// Failing to OPEN the directory is as terminal as failing to sync it, and is
+// latched the same way: every caller has already performed the name change the
+// sync was meant to make durable. truncateTailLocked is the sharp case — it has
+// removed the segments holding a conflicting tail, and leaving the store
+// un-poisoned would ack the next batch while a crash could still resurrect
+// those segments and collide with the re-appended entries.
 func (w *WAL) syncDir() error {
 	d, err := os.Open(w.dir)
 	if err != nil {
+		w.poisoned = true // fail closed: see ErrWALPoisoned
 		return fmt.Errorf("logstore: open dir: %w", err)
 	}
 	if err := w.fsyncf(d); err != nil {

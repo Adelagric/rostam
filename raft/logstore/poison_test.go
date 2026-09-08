@@ -359,3 +359,47 @@ func TestWriteFloorFsyncFailurePoisons(t *testing.T) {
 	}
 	assertFailClosed(t, w, 4)
 }
+
+// TestDirOpenFailurePoisons covers syncDir's OPEN failure, which four callers
+// reach without passing through writeFileDurable's defer. The sharp case is the
+// one exercised here: truncateTailLocked has already closed and removed the
+// segments holding a conflicting tail, so an unlatched store would ack the next
+// batch while a crash could still resurrect those segments and collide with the
+// re-appended entries.
+//
+// The open failure is injected by dropping the directory's permissions, which
+// root ignores — hence the skip.
+func TestDirOpenFailurePoisons(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission checks")
+	}
+	dir := t.TempDir()
+	// Registered AFTER t.TempDir so it runs BEFORE TempDir's removal (cleanups are
+	// LIFO); otherwise the unreadable directory would fail the test's own cleanup.
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o750) })
+
+	w, err := OpenWAL(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	w.maxSeg = 1 // one segment per entry, so a tail truncation removes segments
+	for i := uint64(1); i <= 3; i++ {
+		if err := w.StoreLog(mkLog(i, "a")); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+	if len(w.segs) != 3 {
+		t.Fatalf("want one segment per entry, got %d", len(w.segs))
+	}
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	// Drops entries 2 and 3: segment 3 is removed, then the directory sync that
+	// should make the removal durable cannot even open the directory.
+	err = w.DeleteRange(2, 3)
+	if err == nil || !strings.Contains(err.Error(), "open dir") {
+		t.Fatalf("want the directory open failure, got %v", err)
+	}
+	assertFailClosed(t, w, 2)
+}
