@@ -404,6 +404,14 @@ func TestDirOpenFailurePoisons(t *testing.T) {
 	if err := os.Chmod(dir, 0o300); err != nil {
 		t.Fatal(err)
 	}
+	// PROBE the injection instead of guessing at the environment: root is already
+	// skipped above, but CAP_DAC_OVERRIDE (common in container runtimes) lets a
+	// non-root euid bypass permission checks too. If the directory still opens,
+	// the injection cannot produce the failure this test exists to observe.
+	if d, perr := os.Open(dir); perr == nil {
+		_ = d.Close()
+		t.Skip("environment bypasses directory permission checks (e.g. CAP_DAC_OVERRIDE); injection ineffective")
+	}
 	// Drops entries 2 and 3: the unlink of segment 3 succeeds (w+x on the dir),
 	// then the directory sync that should make that removal durable cannot open
 	// the directory (no read bit) — the exact removed-but-not-durable state the
