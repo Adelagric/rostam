@@ -52,6 +52,19 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   nodes, not the simultaneous loss of every in-sync node for a shard. The mode is
   newer than raft — validate on your workload.
 
+- **Hardening: 32-bit builds no longer panic on an oversized request or
+  response frame length.** The client-facing TCP protocol decoders
+  (`DecodeRequest`, `DecodeResponse`) bounds-checked a declared frame length
+  after converting it to `int`; on a 32-bit build (`GOARCH=386`/`arm`) a
+  declared length of 2 GiB or more wrapped negative during that conversion,
+  defeating the bounds check and panicking an unauthenticated server on a
+  7-byte frame. Found by the new protocol fuzz targets. Both decoders now
+  reject the oversize length while it is still an unsigned 32-bit value, so
+  the `int` conversion can never go negative. They also now reject a
+  per-field-valid length whose reconstructed total frame size exceeds
+  `MaxFrameSize` — the bound the corresponding encoder already panics on —
+  closing a gap where an accepted frame could panic on re-encode.
+
 ## v0.6.0 — 2026-09-02
 
 - **Online compaction for replicated shards (opt-in, off by default).** A
