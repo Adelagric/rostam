@@ -367,12 +367,12 @@ func TestWriteFloorFsyncFailurePoisons(t *testing.T) {
 // store would ack the next batch while a crash could still resurrect those
 // segments and collide with the re-appended entries.
 //
-// The open failure is injected by dropping the directory's permissions, which
-// root ignores — hence the skip. NOTE the same permission bits also block the
-// unlink (os.Remove needs w+x on the directory, and truncateTailLocked discards
-// its error), so under THIS injection the segment file actually stays on disk:
-// the test pins the poison-on-open-failure latch for this call path, not the
-// removed-then-unresolvable state itself, which no permission trick can create.
+// The open failure is injected by dropping the directory's READ permission
+// while keeping w+x (chmod 0o300): the unlink needs w+x and SUCCEEDS, while
+// syncDir's os.Open needs read and FAILS — so the removed-but-not-durable state
+// is actually created, segment file gone and nothing able to make the removal
+// durable. (A 0o000 drop would block the unlink too and only exercise the open
+// failure.) root ignores permission checks — hence the skip.
 func TestDirOpenFailurePoisons(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses directory permission checks")
@@ -396,17 +396,22 @@ func TestDirOpenFailurePoisons(t *testing.T) {
 	if len(w.segs) != 3 {
 		t.Fatalf("want one segment per entry, got %d", len(w.segs))
 	}
-	if err := os.Chmod(dir, 0o000); err != nil {
+	seg3 := w.segs[2].path
+	if err := os.Chmod(dir, 0o300); err != nil {
 		t.Fatal(err)
 	}
-	// Drops entries 2 and 3: the tail truncation runs (the in-memory index and
-	// the fd truncate need no directory permission), then the directory sync that
-	// should make the segment removal durable cannot even open the directory.
-	// (The unlink itself is also blocked by the 0o000 bits and its error is
-	// discarded — see the doc comment above.)
+	// Drops entries 2 and 3: the unlink of segment 3 succeeds (w+x on the dir),
+	// then the directory sync that should make that removal durable cannot open
+	// the directory (no read bit) — the exact removed-but-not-durable state the
+	// doc comment describes, and the latch must trip before the next ack.
 	err = w.DeleteRange(2, 3)
 	if err == nil || !strings.Contains(err.Error(), "open dir") {
 		t.Fatalf("want the directory open failure, got %v", err)
+	}
+	// Stat needs only x on the dir: prove the segment file really was unlinked,
+	// i.e. the state is the sharp one, not merely a failed open.
+	if _, serr := os.Stat(seg3); !os.IsNotExist(serr) {
+		t.Fatalf("segment 3 should be unlinked under 0o300, stat: %v", serr)
 	}
 	assertFailClosed(t, w, 2)
 }
