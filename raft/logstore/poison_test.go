@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -374,6 +375,9 @@ func TestWriteFloorFsyncFailurePoisons(t *testing.T) {
 // durable. (A 0o000 drop would block the unlink too and only exercise the open
 // failure.) root ignores permission checks — hence the skip.
 func TestDirOpenFailurePoisons(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Chmod on Windows honors only the 0o200 bit; the permission injection cannot restrict directory reads there")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses directory permission checks")
 	}
