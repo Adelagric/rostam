@@ -4,6 +4,7 @@ package grpcapi
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -57,6 +58,58 @@ func TestGrpcErrorLeaderlessIsRetryable(t *testing.T) {
 	for _, tc := range cases {
 		if got := status.Code(grpcError(tc.err)); got != codes.Unavailable {
 			t.Errorf("%s: grpcError = %v, want Unavailable (retryable)", tc.name, got)
+		}
+	}
+}
+
+// TestGrpcErrorRecordTooLarge pins vector.ErrRecordTooLarge as a CLIENT error on
+// the gRPC front end. It was classified by neither errIs list, so an oversize
+// record payload came back as codes.Internal — a server fault, which standard
+// gRPC retry policies retry and which tells the caller nothing about the one
+// thing they can fix.
+//
+// The sentinel does not survive every path it can take, so this covers both
+// the in-process shapes (single-payload and bulk, %w-wrapped so errors.Is
+// still finds the sentinel) and the stringified ones a clustered apply
+// produces, where shard.decodePBResult rebuilds the error with
+// errors.New(string(payload)) and errors.Is stops matching — recognized
+// instead by vector.IsRecordTooLargeMessage, an exact-shape matcher.
+func TestGrpcErrorRecordTooLarge(t *testing.T) {
+	single := fmt.Errorf("%w: payload key %q holds a 20000000-byte record, the cap is 16777216 bytes",
+		vector.ErrRecordTooLarge, "session")
+	bulk := fmt.Errorf("payload %d: %w", 3, single)
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrRecordTooLarge},
+		{"single-payload form (%w wrapped)", single},
+		{"bulk form (%w wrapped, real shape checkRecordValuesAll produces)", bulk},
+		{"single-payload form, stringified across replication", errors.New(single.Error())},
+		{"bulk form, stringified across replication", errors.New(bulk.Error())},
+	}
+	for _, tc := range cases {
+		if got := status.Code(grpcError(tc.err)); got != codes.InvalidArgument {
+			t.Errorf("%s: grpcError = %v, want InvalidArgument", tc.name, got)
+		}
+	}
+	// Negative controls: an unrelated internal fault must still be Internal,
+	// including one that merely CONTAINS the sentinel text inside an unrelated
+	// wrapper — the exact bug a bare strings.Contains classifier would
+	// reintroduce (it would leak the WAL path below to the caller).
+	negatives := []struct {
+		name string
+		err  error
+	}{
+		{"unrelated fault, no sentinel text", errors.New("open /var/lib/rostam/shard-7: no such file")},
+		{"unrelated fault wrapping the sentinel (%v)",
+			fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordTooLarge)},
+		{"unrelated fault stringified across replication",
+			errors.New(fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordTooLarge).Error())},
+	}
+	for _, tc := range negatives {
+		if got := status.Code(grpcError(tc.err)); got != codes.Internal {
+			t.Errorf("%s: grpcError = %v, want Internal", tc.name, got)
 		}
 	}
 }

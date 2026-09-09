@@ -499,6 +499,9 @@ func (nc *NamedCollection) InsertCASKeyTTLAt(id uint64, vectors map[string][]flo
 }
 
 func (nc *NamedCollection) insertCASKeyTTLBody(id uint64, vectors map[string][]float32, sparseVectors map[string]*SparseVector, payload Metadata, ttl time.Duration, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs int64) (uint64, error) {
+	if err := checkRecordValues(payload); err != nil {
+		return 0, err
+	}
 	// Validate every name/dim/modality up front so a malformed request mutates
 	// nothing.
 	if err := nc.validateInsertSpaces(vectors, sparseVectors); err != nil {
@@ -667,6 +670,9 @@ func (nc *NamedCollection) insertLockedAt(id uint64, vectors map[string][]float3
 // normal bump (an old record predating the version block defaults a fresh insert
 // to 1).
 func (nc *NamedCollection) RestoreInsert(id uint64, vectors map[string][]float32, sparseVectors map[string]*SparseVector, payload Metadata, ttl time.Duration, keyExpires map[string]uint64, version uint64) error {
+	if err := checkRecordValues(payload); err != nil {
+		return err
+	}
 	if err := nc.validateInsertSpaces(vectors, sparseVectors); err != nil {
 		return err
 	}
@@ -1172,11 +1178,14 @@ func (nc *NamedCollection) liveLockedAt(id uint64, now int64) bool {
 
 // Get retrieves a live point by id: a map of its per-space DEEP-COPIED vectors
 // (only the spaces the point actually populated appear — an omitted space is
-// absent from the map), the shared per-point payload (deep-copied), plus the
+// absent from the map), the shared per-point payload (a map-level copy — see
+// cloneMeta and vtypes.Metadata for the slice-ownership contract), plus the
 // remaining TTL. ok is false for an absent or TTL-expired point (mirror the
 // ScrollDocs liveness gate; the named family has no tombstones — the shared ids
-// set is authoritative). The returned vectors/payload are owned by the caller
-// (mutating them never corrupts the sub-arenas or the shared meta map). For a
+// set is authoritative). The returned vectors are owned by the caller, and so is
+// the payload MAP (adding or removing keys never corrupts the shared meta map);
+// a slice-backed Value inside it still points at stored bytes and must not be
+// written through. For a
 // cosine-metric space the returned vector is the NORMALIZED vector (Insert
 // normalizes on the way in). ttl is the remaining duration to the shared
 // deadline (0 = no expiry). Lock order: nc.mu (read) outer, then each sub-index's
@@ -1201,8 +1210,9 @@ func (nc *NamedCollection) Get(id uint64) (vectors map[string][]float32, payload
 			}
 		}
 	}
-	// Drop per-key-TTL-expired keys, then deep-copy so the caller owns the payload
-	// (liveMetaMap may alias nc.meta on the no-expiry fast path).
+	// Drop per-key-TTL-expired keys, then copy the map so the caller owns it
+	// (liveMetaMap may alias nc.meta on the no-expiry fast path). Slice-backed
+	// Values inside still point at stored bytes — vtypes.Metadata's contract.
 	payload = cloneMeta(liveMetaMap(nc.meta[id], nc.keyTTL[id], nc.nowMs()))
 	if dl := nc.ttl[id]; dl != 0 {
 		if now := nc.nowMs(); dl > now {
@@ -1246,6 +1256,9 @@ func (nc *NamedCollection) setPayloadLocked(id uint64, patch Metadata, keyTTLMs 
 }
 
 func (nc *NamedCollection) setPayloadLockedAt(id uint64, patch Metadata, keyTTLMs map[string]int64, cas CASCond, now int64) (Metadata, map[string]int64, uint64, error) {
+	if err := checkRecordValues(patch); err != nil {
+		return nil, nil, 0, err
+	}
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
 	if !nc.liveLockedAt(id, now) {
@@ -1394,6 +1407,9 @@ func (nc *NamedCollection) overwritePayloadLocked(id uint64, meta Metadata, keyT
 }
 
 func (nc *NamedCollection) overwritePayloadLockedAt(id uint64, meta Metadata, keyTTLMs map[string]int64, cas CASCond, now int64) (Metadata, map[string]int64, uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return nil, nil, 0, err
+	}
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
 	if !nc.liveLockedAt(id, now) {

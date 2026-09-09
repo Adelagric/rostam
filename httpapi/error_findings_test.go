@@ -4,6 +4,7 @@ package httpapi
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -270,5 +271,65 @@ func TestStatusForErrorAlreadyPartitioned(t *testing.T) {
 	if got := statusForError(err); got != http.StatusConflict {
 		t.Fatalf("statusForError(already partitioned) = %d, want %d (409 Conflict)",
 			got, http.StatusConflict)
+	}
+}
+
+// TestStatusForErrorRecordTooLarge pins the HTTP status for an oversize record
+// payload at 400 in every shape the sentinel can arrive in. The sentinel arm
+// was already classified; the message-shape arm (vector.IsRecordTooLargeMessage)
+// is what recognizes the STRINGIFIED forms — the shape a clustered write
+// produces (shard.decodePBResult rebuilds an op error with errors.New across
+// replication, so errors.Is stops matching) — and unclassified it fell through
+// to the redacted 500 bucket, a server fault for a mistake the caller can fix
+// by sending a smaller record.
+//
+// The message-shape arm is an exact-shape matcher, not a bare strings.Contains:
+// the negative controls assert that an unrelated internal error whose message
+// merely contains the sentinel text is still redacted as a 500.
+func TestStatusForErrorRecordTooLarge(t *testing.T) {
+	single := fmt.Errorf("%w: payload key %q holds a 20000000-byte record, the cap is 16777216 bytes",
+		vector.ErrRecordTooLarge, "session")
+	bulk := fmt.Errorf("payload %d: %w", 3, single)
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrRecordTooLarge},
+		{"single-payload form (%w wrapped)", single},
+		{"bulk form (%w wrapped, real shape checkRecordValuesAll produces)", bulk},
+		{"single-payload form, stringified across replication", errors.New(single.Error())},
+		{"bulk form, stringified across replication", errors.New(bulk.Error())},
+	}
+	for _, tc := range cases {
+		if got := statusForError(tc.err); got != http.StatusBadRequest {
+			t.Errorf("%s: statusForError = %d, want 400", tc.name, got)
+		}
+		// A 4xx must keep its descriptive message: it names only the caller's own
+		// payload key and the two sizes.
+		status, msg := clientError("vector_insert", tc.err)
+		if status == http.StatusInternalServerError || msg == "internal error" {
+			t.Errorf("%s: clientError redacted a client-facing error: status=%d msg=%q", tc.name, status, msg)
+		}
+		if !strings.Contains(msg, "exceeds the storage cap") {
+			t.Errorf("%s: message lost the cap text: %q", tc.name, msg)
+		}
+	}
+	// Negative controls: an unrelated fault is still a redacted 500, including
+	// one that merely CONTAINS the sentinel text inside an unrelated wrapper —
+	// the exact bug a bare strings.Contains classifier would reintroduce.
+	negatives := []struct {
+		name string
+		err  error
+	}{
+		{"unrelated fault, no sentinel text", errors.New("open /var/lib/rostam/shard-7: no such file")},
+		{"unrelated fault wrapping the sentinel (%v)",
+			fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordTooLarge)},
+		{"unrelated fault stringified across replication",
+			errors.New(fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordTooLarge).Error())},
+	}
+	for _, tc := range negatives {
+		if got := statusForError(tc.err); got != http.StatusInternalServerError {
+			t.Errorf("%s: statusForError = %d, want 500", tc.name, got)
+		}
 	}
 }

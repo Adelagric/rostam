@@ -66,6 +66,7 @@ const (
 	ValueInts    = vtypes.ValueInts
 	ValueFloats  = vtypes.ValueFloats
 	ValueGeo     = vtypes.ValueGeo
+	ValueRecord  = vtypes.ValueRecord
 
 	Cosine     = vtypes.Cosine
 	L2         = vtypes.L2
@@ -108,6 +109,8 @@ const (
 	FilterGeoRadius  = vtypes.FilterGeoRadius
 	FilterGeoBox     = vtypes.FilterGeoBox
 	FilterGeoPolygon = vtypes.FilterGeoPolygon
+	FilterRowExists  = vtypes.FilterRowExists
+	FilterRowAbsent  = vtypes.FilterRowAbsent
 
 	// Query leaf kinds.
 	LeafDense     = vtypes.LeafDense
@@ -162,6 +165,7 @@ var (
 	NewInts    = vtypes.NewInts
 	NewFloats  = vtypes.NewFloats
 	NewGeo     = vtypes.NewGeo
+	NewRecord  = vtypes.NewRecord
 
 	// DefaultConfig is re-exported as a function value so every DefaultConfig()
 	// call site is unchanged.

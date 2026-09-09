@@ -4,6 +4,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -144,5 +145,65 @@ func TestMapResultKeepsWASMUpdateRefusalVisible(t *testing.T) {
 	}
 	if !strings.Contains(msg, "NEW op name") {
 		t.Errorf("payload = %q, want the remedy to survive", msg)
+	}
+}
+
+// TestMapResultKeepsRecordTooLargeVisible pins vector.ErrRecordTooLarge as a
+// client-facing signal on the binary transport, in every shape it can arrive
+// in. The sentinel arm was already classified; the message-shape arm is the
+// one that recognizes the STRINGIFIED forms — shard.decodePBResult rebuilds
+// an op error with errors.New(string(payload)) across replication, so
+// errors.Is stops matching and the caller got the redacted "internal error"
+// for a mistake they could have fixed.
+//
+// The message-shape arm is vector.IsRecordTooLargeMessage, an exact-shape
+// matcher, NOT a bare strings.Contains — the negative controls below assert
+// that distinction: an unrelated internal error whose message merely contains
+// the sentinel text must still be redacted.
+func TestMapResultKeepsRecordTooLargeVisible(t *testing.T) {
+	disp := &fakeDispatcher{}
+	single := fmt.Errorf("%w: payload key %q holds a 20000000-byte record, the cap is 16777216 bytes",
+		vector.ErrRecordTooLarge, "session")
+	bulk := fmt.Errorf("payload %d: %w", 3, single)
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrRecordTooLarge},
+		{"single-payload form (%w wrapped)", single},
+		{"bulk form (%w wrapped, real shape checkRecordValuesAll produces)", bulk},
+		{"single-payload form, stringified across replication", errors.New(single.Error())},
+		{"bulk form, stringified across replication", errors.New(bulk.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, payload := mapResult(disp, nil, tc.err, "")
+			msg, err := DecodeErrorPayload(payload)
+			if err != nil {
+				t.Fatalf("DecodeErrorPayload: %v", err)
+			}
+			if msg == "internal error" || !strings.Contains(msg, "exceeds the storage cap") {
+				t.Errorf("record-too-large redacted: got %q", msg)
+			}
+		})
+	}
+	// Negative controls: an unrelated fault is still redacted, including one
+	// that merely CONTAINS the sentinel text inside an unrelated wrapper — the
+	// exact bug a bare strings.Contains classifier would reintroduce.
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"unrelated fault, no sentinel text", errors.New("open /var/lib/rostam/shard-7: no such file")},
+		{"unrelated fault wrapping the sentinel (%v)",
+			fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordTooLarge)},
+		{"unrelated fault stringified across replication",
+			errors.New(fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordTooLarge).Error())},
+	} {
+		t.Run("negative/"+tc.name, func(t *testing.T) {
+			_, payload := mapResult(disp, nil, tc.err, "")
+			if msg, _ := DecodeErrorPayload(payload); msg != "internal error" {
+				t.Errorf("unrelated fault = %q, want the redacted message", msg)
+			}
+		})
 	}
 }

@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/rostamlabs/rostam/sdk/record"
 )
 
 // Predicate is a compiled filter: given a vector's metadata (nil if the
@@ -68,7 +71,8 @@ func compileNode(f Filter) (Predicate, error) {
 	case FilterEq, FilterNe, FilterGt, FilterGte, FilterLt, FilterLte, FilterIn, FilterContains,
 		FilterMatch, FilterRegex, FilterIsEmpty, FilterIsNull,
 		FilterDtGt, FilterDtGte, FilterDtLt, FilterDtLte,
-		FilterGeoRadius, FilterGeoBox, FilterGeoPolygon:
+		FilterGeoRadius, FilterGeoBox, FilterGeoPolygon,
+		FilterRowExists, FilterRowAbsent:
 		return compileLeaf(f)
 	default:
 		return nil, fmt.Errorf("vector: unknown filter op %d", f.Op)
@@ -93,17 +97,21 @@ func compileLeaf(f Filter) (Predicate, error) {
 	}
 	field := f.Field
 	want := f.Value
+	// The record path in field (when it has one) is a compile-time constant:
+	// newFieldLookup parses it ONCE here so the per-point work in the closures
+	// below is a map lookup plus at most one Resolve. See fieldLookup.
+	look := newFieldLookup(field)
 
 	switch f.Op {
 	case FilterEq:
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			return ok && got.Equal(want)
 		}, nil
 	case FilterNe:
 		// Strict-exists: a missing field does NOT satisfy 'ne'.
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			return ok && !got.Equal(want)
 		}, nil
 	case FilterGt, FilterGte, FilterLt, FilterLte:
@@ -124,6 +132,8 @@ func compileLeaf(f Filter) (Predicate, error) {
 		return compileDatetime(field, f.Op, want)
 	case FilterGeoRadius, FilterGeoBox, FilterGeoPolygon:
 		return compileGeo(field, f.Op, f.Geo)
+	case FilterRowExists, FilterRowAbsent:
+		return compileRowPresence(f)
 	default:
 		return nil, fmt.Errorf("vector: compileLeaf called with non-leaf op %d", f.Op)
 	}
@@ -133,8 +143,9 @@ func compileLeaf(f Filter) (Predicate, error) {
 // float64 (int and float interoperate); string fields compare lexicographically.
 // A kind mismatch or missing field evaluates to false.
 func compileOrdering(field string, op FilterOp, want Value) (Predicate, error) {
+	look := newFieldLookup(field)
 	return func(m Metadata) bool {
-		got, ok := lookupPath(m, field)
+		got, ok := look.get(m)
 		if !ok {
 			return false
 		}
@@ -238,11 +249,12 @@ func compareString(a, b string) int {
 // compileIn builds an 'in' predicate: the field's scalar value must be a
 // member of the want array (strings/ints/floats). Type checked at compile.
 func compileIn(field string, want Value) (Predicate, error) {
+	look := newFieldLookup(field)
 	switch want.Kind {
 	case ValueStrings:
 		set := want.Strs
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueString {
 				return false
 			}
@@ -256,7 +268,7 @@ func compileIn(field string, want Value) (Predicate, error) {
 	case ValueInts:
 		set := want.Ints
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueInt {
 				return false
 			}
@@ -270,7 +282,7 @@ func compileIn(field string, want Value) (Predicate, error) {
 	case ValueFloats:
 		set := want.Flts
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueFloat {
 				return false
 			}
@@ -289,11 +301,12 @@ func compileIn(field string, want Value) (Predicate, error) {
 // compileContains builds a 'contains' predicate: the field must be an array
 // (strings/ints/floats) containing the want scalar. Type checked at compile.
 func compileContains(field string, want Value) (Predicate, error) {
+	look := newFieldLookup(field)
 	switch want.Kind {
 	case ValueString:
 		needle := want.Str
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueStrings {
 				return false
 			}
@@ -307,7 +320,7 @@ func compileContains(field string, want Value) (Predicate, error) {
 	case ValueInt:
 		needle := want.Int
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueInts {
 				return false
 			}
@@ -321,7 +334,7 @@ func compileContains(field string, want Value) (Predicate, error) {
 	case ValueFloat:
 		needle := want.Flt
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueFloats {
 				return false
 			}
@@ -411,8 +424,9 @@ func compileMatch(field string, want Value) (Predicate, error) {
 		return nil, fmt.Errorf("vector: filter op 'match' requires a string value, got kind %d", want.Kind)
 	}
 	queryTokens := tokenize(want.Str)
+	look := newFieldLookup(field)
 	return func(m Metadata) bool {
-		got, ok := lookupPath(m, field)
+		got, ok := look.get(m)
 		if !ok {
 			return false
 		}
@@ -558,8 +572,9 @@ func compileRegex(field string, want Value) (Predicate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vector: filter op 'regex' has invalid pattern %q: %w", want.Str, err)
 	}
+	look := newFieldLookup(field)
 	return func(m Metadata) bool {
-		got, ok := lookupPath(m, field)
+		got, ok := look.get(m)
 		if !ok {
 			return false
 		}
@@ -583,8 +598,9 @@ func compileRegex(field string, want Value) (Predicate, error) {
 // present with ValueNone, an empty string, or an empty array. It returns an
 // error for signature uniformity with the other leaf compilers; it never fails.
 func compileIsEmpty(field string) (Predicate, error) {
+	look := newFieldLookup(field)
 	return func(m Metadata) bool {
-		got, ok := lookupPath(m, field)
+		got, ok := look.get(m)
 		if !ok {
 			return true
 		}
@@ -605,6 +621,12 @@ func compileIsEmpty(field string) (Predicate, error) {
 			// absence). Made explicit instead of relying on the default below so a
 			// future kind can't silently inherit the wrong answer here.
 			return false
+		case ValueRecord:
+			// A record's own emptiness is its byte length, mirroring the
+			// ValueString case above — an explicit case rather than falling to
+			// the default (which would wrongly answer "never empty" the way a
+			// geo point never is).
+			return len(got.Rec) == 0
 		default:
 			return false
 		}
@@ -615,9 +637,14 @@ func compileIsEmpty(field string) (Predicate, error) {
 // its kind is ValueNone (an explicit null). An absent field is NOT null —
 // that's the is_empty/is_null distinction. It returns an error for signature
 // uniformity with the other leaf compilers; it never fails.
+//
+// ValueRecord considered: this checks presence + ValueNone only (no per-kind
+// switch), so a present record already answers correctly — not null — with no
+// change needed here.
 func compileIsNull(field string) (Predicate, error) {
+	look := newFieldLookup(field)
 	return func(m Metadata) bool {
-		got, ok := lookupPath(m, field)
+		got, ok := look.get(m)
 		return ok && got.Kind == ValueNone
 	}, nil
 }
@@ -628,6 +655,7 @@ func compileIsNull(field string) (Predicate, error) {
 // closure. The field is read via numericValue (datetime stored as int64
 // unix-ms by convention). Missing/non-numeric field → false.
 func compileDatetime(field string, op FilterOp, want Value) (Predicate, error) {
+	look := newFieldLookup(field)
 	ms, ok := datetimeBound(want)
 	if !ok {
 		if want.Kind != ValueString {
@@ -637,7 +665,7 @@ func compileDatetime(field string, op FilterOp, want Value) (Predicate, error) {
 	}
 	bound := float64(ms)
 	return func(m Metadata) bool {
-		got, ok := lookupPath(m, field)
+		got, ok := look.get(m)
 		if !ok {
 			return false
 		}
@@ -696,6 +724,7 @@ func dtToOrdering(op FilterOp) FilterOp {
 // slice itself) and only reads the field via lookupPath, requiring a ValueGeo
 // (missing field or non-geo kind -> false).
 func compileGeo(field string, op FilterOp, g *GeoCondition) (Predicate, error) {
+	look := newFieldLookup(field)
 	if g == nil {
 		return nil, fmt.Errorf("vector: filter op %q requires a 'geo' condition", mustOpName(op))
 	}
@@ -712,7 +741,7 @@ func compileGeo(field string, op FilterOp, g *GeoCondition) (Predicate, error) {
 		}
 		centerLat, centerLon, radius := g.CenterLat, g.CenterLon, g.RadiusM
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueGeo {
 				return false
 			}
@@ -735,7 +764,7 @@ func compileGeo(field string, op FilterOp, g *GeoCondition) (Predicate, error) {
 		}
 		minLat, minLon, maxLat, maxLon := g.MinLat, g.MinLon, g.MaxLat, g.MaxLon
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueGeo {
 				return false
 			}
@@ -755,7 +784,7 @@ func compileGeo(field string, op FilterOp, g *GeoCondition) (Predicate, error) {
 			}
 		}
 		return func(m Metadata) bool {
-			got, ok := lookupPath(m, field)
+			got, ok := look.get(m)
 			if !ok || got.Kind != ValueGeo {
 				return false
 			}
@@ -776,6 +805,145 @@ func validateLatLon(lat, lon float64) error {
 		return fmt.Errorf("longitude %v out of range [-180,180]", lon)
 	}
 	return nil
+}
+
+// compileRowPresence builds the FilterRowExists / FilterRowAbsent predicate.
+// f.Field must have the "payloadKey/path" shape (record.SplitField) with a
+// path naming exactly a table row (a field segment then a row segment, e.g.
+// "b/42") — that shape is validated ONCE here, at compile time, because it
+// depends only on the filter's field STRING, never on any point's data; the
+// parsed record.Path is cached in the closure so per-point work is Resolve
+// only, per the Task 5 parsing-cost ruling (contrast with lookupPath, which
+// re-parses per call because it is shared by every scalar leaf op and has no
+// dedicated per-op compile step).
+//
+// At each point, row_exists is true iff Resolve reports Kind == RowPresent.
+// Every "cannot apply" outcome — a missing payload key, a payload key that
+// is not a ValueRecord, or a Resolve error (e.g. the record's schema puts a
+// scalar where this filter expects a table) — already falls out of the
+// Kind != RowPresent check, so row_exists needs no separate branch for it.
+//
+// The per-point closure tries the EXACT payload key m[f.Field] first, like
+// every other leaf op (lookupPath, fieldLookup.get): a literal payload key
+// that itself contains '/' wins over splitting the field. Both ops answer
+// false for such a point — the field named a value, not a table. Only the
+// SHAPE check above is compile-time; whether a literal key exists varies per
+// point and cannot be hoisted.
+//
+// row_absent is DELIBERATELY NOT simply "not row_exists": it reports true
+// only when the row is PROVED missing from a REAL table on this point
+// (record.Resolver.RowAbsentProven) — never for a point that cannot even be
+// asked the question, and never on a record whose bytes could be hiding the
+// row. Concretely, row_absent answers false (not true) when the payload key
+// is missing, holds something other than a ValueRecord, holds a record whose
+// shape has NO SUCH FIELD at all (an unknown field name, or an out-of-range
+// position), when Resolve errors (e.g. this point's record has a scalar, not
+// a table, at that field), or when the table it names is malformed — rows out
+// of the ascending key order the format requires, which is the case a binary
+// search cannot distinguish from a genuinely missing row. The rationale: "the
+// row is absent" presupposes there was a table to search; a point with no such
+// record, no such table, or an unreadable one, is not in a position to assert
+// anything about a row inside it. This is the one asymmetry in an
+// otherwise-mirrored pair of ops, and it is why row_absent cannot be compiled
+// as `!rowExists(m)`.
+func compileRowPresence(f Filter) (Predicate, error) {
+	payloadKey, pathStr, ok := record.SplitField(f.Field)
+	if !ok {
+		return nil, fmt.Errorf("vector: filter op %q requires a payloadKey/path field, got %s", mustOpName(f.Op), clipField(f.Field))
+	}
+	p, err := record.ParsePath(pathStr)
+	if err != nil {
+		return nil, fmt.Errorf("vector: filter op %q has an invalid record path %s: %w", mustOpName(f.Op), clipField(pathStr), err)
+	}
+	if len(p.Segs) != 2 || p.Segs[1].Kind != record.SegRow {
+		return nil, fmt.Errorf("vector: filter op %q requires a path naming exactly a table row (field/row), got %s", mustOpName(f.Op), clipField(pathStr))
+	}
+	exists := f.Op == FilterRowExists
+	field := f.Field
+	return func(m Metadata) bool {
+		if m == nil {
+			return false
+		}
+		// EXACT PAYLOAD KEY FIRST, exactly as lookupPath and fieldLookup.get
+		// resolve a field string: a literal payload key wins over splitting at
+		// the first '/'. Whether the literal key exists is a per-POINT fact, so
+		// this cannot be hoisted to the compile-time validation above; only the
+		// path SHAPE can be.
+		//
+		// Both ops answer false here, and for the same reason: the field named a
+		// literal payload value, not a table, so there was never a table to
+		// search. row_exists is false because no row was found; row_absent is
+		// false by the same asymmetry documented above — a point that cannot be
+		// asked the question is not in a position to assert anything about a row.
+		// Without this, a point holding both {"session": <record>} and a literal
+		// "session/b/42" key answered row_exists true while lookupPath on the
+		// same field returned the literal value, so two seams disagreed about one
+		// field string — the divergence the exact-key-first rule exists to
+		// prevent.
+		if _, exact := m[field]; exact {
+			return false
+		}
+		rv, ok := m[payloadKey]
+		if !ok || rv.Kind != ValueRecord {
+			return false
+		}
+		if exists {
+			// Row PRESENCE is proof of itself: Resolve returns RowPresent only
+			// for a row whose stored key equals the one asked for, so the hot
+			// path stays one Resolve and no allocation.
+			res, rerr := recordResolver.Resolve(rv.Rec, p)
+			if rerr != nil {
+				return false
+			}
+			return res.Kind == record.RowPresent
+		}
+		// row_absent asserts something POSITIVE about a point, so it cannot rest
+		// on either of Resolve's two documented leniencies. RowAbsentProven
+		// carries both checks:
+		//
+		//   - the field must really resolve to a TABLE. resolveSchema answers
+		//     Absent for a field NAME that is not in this record's schema (and
+		//     for an out-of-range position) BEFORE it looks for a row, so
+		//     "session/zzz/42" on a record with no zzz field used to read as "the
+		//     row is missing from the table" — contradicting the contract above,
+		//     and disagreeing with the neighbouring case where a SCALAR at the
+		//     field errors with ErrPath and correctly answers false;
+		//   - the table's rows must actually be in the ascending key order the
+		//     format requires. Resolve's schema-mode row lookup is a binary
+		//     search, which cannot see disorder, so an out-of-order table answers
+		//     Absent for a row that IS stored — and record bytes are not
+		//     validated at ingest in this phase, so that record is storable.
+		//
+		// Both checks run ONLY here, only for points that already resolved
+		// Absent, and the walk is bounded by the row count Resolve bounded
+		// against the record's own length. An error (a malformed record) answers
+		// false, exactly like every other "cannot apply" outcome.
+		proven, perr := recordResolver.RowAbsentProven(rv.Rec, p)
+		return perr == nil && proven
+	}, nil
+}
+
+// clipField renders a caller-supplied field or record path for an error
+// message: the whole thing when it is short, otherwise a 64-byte prefix and
+// the full length.
+//
+// The field string is attacker-controlled and bounded only by the route body
+// cap (httpapi's maxJSONBody, 32 MiB), so quoting it whole made REJECTING a
+// hostile filter allocate another copy of it — with %q, up to four bytes of
+// escapes per input byte — which is the cost the bound in record.ParsePath was
+// added to avoid. The length is what a caller actually needs to see when the
+// path is too long; the prefix is what they need when it is merely wrong, and
+// 64 bytes shows a real path in full (the grammar's own cap is 1024).
+//
+// This is compile-time only, once per filter leaf per request, so the cost of
+// the branch is irrelevant — but so is the cost of quoting the whole input,
+// which is exactly why there is no reason to pay it.
+func clipField(s string) string {
+	const maxShown = 64
+	if len(s) <= maxShown {
+		return strconv.Quote(s)
+	}
+	return fmt.Sprintf("%s… (%d bytes)", strconv.Quote(s[:maxShown]), len(s))
 }
 
 func mustOpName(op FilterOp) string {

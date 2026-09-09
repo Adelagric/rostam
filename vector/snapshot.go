@@ -997,6 +997,7 @@ func readString(r io.Reader) (string, error) {
 //	ints:    [count:u32] then each [i64]
 //	floats:  [count:u32] then each [f64]
 //	geo:     [lat:f64][lon:f64]
+//	record:  [len:u32][bytes]
 func writeValue(w io.Writer, v Value) error {
 	if _, err := w.Write([]byte{byte(v.Kind)}); err != nil {
 		return err
@@ -1053,11 +1054,61 @@ func writeValue(w io.Writer, v Value) error {
 			return err
 		}
 		return writeF64(w, v.Lon)
+	case ValueRecord:
+		// [len:u32][bytes], mirroring ValueString above. This one function pair
+		// serves WAL, snapshot, and persist, so this case makes a record-bearing
+		// collection durable on every path.
+		if len(v.Rec) > maxRecordValueBytes {
+			// Keeps the invariant symmetric with readValue's reject-on-read below:
+			// nothing this process ever writes can trip the read-side bound, so a
+			// bound failure on read always means a hostile or corrupt frame, never
+			// one of our own snapshots/WAL entries.
+			return fmt.Errorf("%w: record value %d bytes exceeds %d byte cap", ErrSnapshotFormat, len(v.Rec), maxRecordValueBytes)
+		}
+		if err := writeU32(w, uint32(len(v.Rec))); err != nil {
+			return err
+		}
+		_, err := w.Write(v.Rec)
+		return err
 	case ValueNone:
 		return nil
 	default:
 		return fmt.Errorf("%w: unknown value kind %d", ErrSnapshotFormat, v.Kind)
 	}
+}
+
+// maxRecordValueBytes hard-bounds a single ValueRecord's byte length on
+// read, independent of the reader type. It equals maxOperateRecordBytes
+// (ops/operate_engine.go, design doc §2.7) — the cap the operate engine
+// already enforces on a STORED record before it can ever reach writeValue —
+// so a length prefix claiming more than this cannot possibly be a valid
+// record: it is either a corrupt frame or hostile input, and is rejected
+// before any allocation. vector cannot import ops (ops depends on vector),
+// so the value is duplicated rather than shared; keep the two in sync.
+const maxRecordValueBytes = 16 << 20
+
+// sizedReader is implemented by readers that can report how many bytes remain
+// unread (e.g. *bytes.Reader). readValue's ValueRecord case uses it as an
+// EARLY out ahead of the maxRecordValueBytes check below, when available —
+// but the hard cap is the actual guarantee: every real production reader
+// (WAL, Restore, named, IVF — all bufio-wrapped) has no Len(), so relying on
+// this alone left every one of those paths exposed to a hostile length
+// prefix driving make([]byte, n) up to ~4 GiB before io.ReadFull ever got a
+// chance to fail on the short read.
+type sizedReader interface{ Len() int }
+
+func boundedRecordBytes(r io.Reader, n uint32) ([]byte, error) {
+	if n > maxRecordValueBytes {
+		return nil, fmt.Errorf("%w: record length %d exceeds %d byte cap", ErrSnapshotFormat, n, maxRecordValueBytes)
+	}
+	if sr, ok := r.(sizedReader); ok && uint64(n) > uint64(sr.Len()) {
+		return nil, fmt.Errorf("%w: record length %d exceeds %d remaining bytes", ErrSnapshotFormat, n, sr.Len())
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 func readValue(r io.Reader) (Value, error) {
@@ -1142,6 +1193,16 @@ func readValue(r io.Reader) (Value, error) {
 		}
 		v.Lat = lat
 		v.Lon = lon
+	case ValueRecord:
+		n, err := readU32(r)
+		if err != nil {
+			return Value{}, err
+		}
+		buf, err := boundedRecordBytes(r, n)
+		if err != nil {
+			return Value{}, err
+		}
+		v.Rec = buf
 	case ValueNone:
 		// no payload
 	default:

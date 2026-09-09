@@ -491,6 +491,21 @@ func writeInternalError(w http.ResponseWriter, ctx string, err error) {
 func statusForError(err error) int {
 	switch {
 	case errors.Is(err, vector.ErrDimMismatch),
+		// A payload carrying a record value above the storage cap: 400, not 500.
+		// The cap is the snapshot/WAL codec's, so accepting the write would mean
+		// acking something that can never be made durable; refusing it is a
+		// client-fixable mistake and the message is the caller's own data.
+		// Keeps this classifier in sync with server.clientFacingErr.
+		//
+		// Matched by sentinel AND by exact message shape: a clustered apply
+		// rebuilds the op error with errors.New across the replication boundary
+		// (shard.decodePBResult), so errors.Is alone loses it there and the error
+		// would fall through to the redacted 500 bucket. The message-shape arm
+		// uses vector.IsRecordTooLargeMessage, NOT strings.Contains — a bare
+		// substring check would also match an unrelated internal error that
+		// merely wraps the sentinel, leaking it to the caller unredacted.
+		errors.Is(err, vector.ErrRecordTooLarge),
+		vector.IsRecordTooLargeMessage(err.Error()),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),

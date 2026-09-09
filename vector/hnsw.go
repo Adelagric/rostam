@@ -1902,6 +1902,9 @@ func (h *hnsw) InsertAt(id uint64, vec []float32, ttl time.Duration, meta Metada
 // one-snapshot rule and byte-identical to the historical multi-read path under a
 // stable clock.
 func (h *hnsw) insertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (uint64, map[string]uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return 0, nil, err
+	}
 	// A failed mmap slab growth freed the backing region; reject rather than
 	// write into it (see arena.poisoned / ErrIndexPoisoned).
 	if h.arena.poisoned.Load() {
@@ -2011,6 +2014,9 @@ func (h *hnsw) RestoreInsertAt(id uint64, vec []float32, ttl time.Duration, meta
 }
 
 func (h *hnsw) restoreInsertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, stamped bool, nowMs uint64) error {
+	if err := checkRecordValues(meta); err != nil {
+		return err
+	}
 	if len(vec) != h.cfg.Dim {
 		return ErrDimMismatch
 	}
@@ -2516,11 +2522,16 @@ func (h *hnsw) linkRead(t *linkTask) {
 	h.linkNode(s, t.nd, t.stored, t.level, t.now)
 }
 
-// Get retrieves the live record for id: a DEEP COPY of its vector, metadata, and
+// Get retrieves the live record for id: a copy of its vector, metadata map, and
 // sparse vector, plus the remaining TTL. ok is false when id is absent,
 // tombstoned (deleted), or TTL-expired — the exact liveness gate the search path
-// uses (mirror admits). The returned vec/meta/sparse are owned by the caller
-// (mutating them never corrupts the arena). For a cosine-metric index the stored
+// uses (mirror admits). The returned vec/sparse are owned by the caller, and so
+// is the meta MAP — inserting or deleting keys in it never reaches the arena.
+// The Values inside it are copied as structs, so a slice-backed one
+// (strings/ints/floats/record) still points at the arena's own bytes: read it,
+// never write through it. That is vtypes.Metadata's documented slice-ownership
+// contract, identical for all four kinds; a caller that needs to own the bytes
+// copies them, and every network client already gets a codec-written copy. For a cosine-metric index the stored
 // (and therefore returned) vector is the NORMALIZED vector, not the original
 // caller-supplied one — Insert normalizes on the way in. ttl is the remaining
 // duration to the deadline (0 = no expiry).
@@ -2676,10 +2687,17 @@ func keyExpired(deadline, now uint64) bool {
 	return deadline != 0 && deadline <= now
 }
 
-// cloneMeta returns a deep copy of m, or nil when m is empty. Callers that read
-// m from arena.Metadata(slot) MUST hold h.mu (read or write) while doing so; the
-// copy then lets the four payload mutators build newMeta without aliasing arena
-// storage.
+// cloneMeta returns a MAP-level copy of m, or nil when m is empty: a fresh map
+// holding the same Values, so adding, replacing or deleting a key in the copy
+// never touches the arena's map. The Values themselves are copied as structs,
+// which means a slice-backed Value (strings/ints/floats/record) still points at
+// the same backing bytes — the payload mutators only ever replace whole Values,
+// never write through one, and vtypes.Metadata documents that contract for
+// callers too.
+//
+// Callers that read m from arena.Metadata(slot) MUST hold h.mu (read or write)
+// while doing so; the copy then lets the four payload mutators build newMeta
+// without aliasing the arena's MAP.
 func cloneMeta(m Metadata) Metadata {
 	if len(m) == 0 {
 		return nil
@@ -2869,6 +2887,9 @@ func (h *hnsw) SetPayloadAt(id uint64, patch Metadata, keyTTLMs map[string]int64
 }
 
 func (h *hnsw) setPayloadBody(id uint64, patch Metadata, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (Metadata, map[string]uint64, uint64, error) {
+	if err := checkRecordValues(patch); err != nil {
+		return nil, nil, 0, err
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	now := nowMs
@@ -2936,6 +2957,9 @@ func (h *hnsw) OverwritePayloadAt(id uint64, meta Metadata, keyTTLMs map[string]
 }
 
 func (h *hnsw) overwritePayloadBody(id uint64, meta Metadata, keyTTLMs map[string]int64, cas CASCond, stamped bool, nowMs uint64) (Metadata, map[string]uint64, uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return nil, nil, 0, err
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	now := nowMs
@@ -3067,6 +3091,9 @@ func (h *hnsw) clearPayloadBody(id uint64, cas CASCond, stamped bool, nowMs uint
 // section. Returns ErrIDNotFound for a dead/absent point. Both maps are stored by
 // reference (caller hands off ownership); nil clears the respective state.
 func (h *hnsw) RestorePayload(id uint64, meta Metadata, keyExpires map[string]uint64, version uint64) error {
+	if err := checkRecordValues(meta); err != nil {
+		return err
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	slot, ok := h.arena.Slot(id)
@@ -3159,6 +3186,9 @@ func (h *hnsw) InsertIfAbsentVersionAt(id uint64, vec []float32, ttl time.Durati
 }
 
 func (h *hnsw) insertIfAbsentBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, stamped bool, nowMs uint64) (inserted bool, err error) {
+	if err := checkRecordValues(meta); err != nil {
+		return false, err
+	}
 	start := time.Now()
 	defer func() { h.insertLat.observe(time.Since(start)) }()
 

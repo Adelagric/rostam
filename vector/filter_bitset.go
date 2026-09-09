@@ -443,10 +443,16 @@ func (h *hnsw) gateProfitable(minSize, nsets, k int) bool {
 //     cannot appear in an exact plan; an And containing one is a superset plan
 //     (the un-narrowed conjunct is re-checked by the predicate).
 //
-// contentField is declined here too, but it is no longer THIS function's
-// problem and the checks below are now defence in depth: indexNarrowable
-// declines $content at every posting-set lookup, so no $content set reaches a
-// plan at all.
+// contentField and the record paths the index cannot prove anything about are
+// declined here too, through the SAME indexNarrowable the posting-set lookups
+// use (which is why this function needs the index's malformed-record state:
+// a path under a poisoned payload key must never be graded exact, because the
+// damaged record still resolves fields that were never posted). Upstream
+// already declines them at every collect* helper, so none of them normally
+// reaches a plan for these checks to grade — but this function derives its own
+// answer per op straight from f.Field rather than from what collectNarrowSets
+// happened to plan, so it must independently agree rather than trust that
+// whatever reached it was already filtered.
 //
 // The original note here read "only the EXACT classification could turn that
 // into wrong results — a superset plan re-checks, and an empty gate just rejects
@@ -462,26 +468,28 @@ func (h *hnsw) gateProfitable(minSize, nsets, k int) bool {
 // slot, which would let an exact gate admit a slot the predicate rejects. The
 // caller gates exactness on the arena's per-key-deadline count being zero
 // (buildAdmitGate); this function is about op semantics only.
-func filterIndexExact(f Filter) bool {
+func filterIndexExact(f Filter, poison recordPoison) bool {
 	switch f.Op {
 	case FilterEq, FilterContains:
-		if f.Field == contentField {
+		if !indexNarrowable(f.Field, f.Op, poison) {
 			return false
 		}
 		_, ok := scalarKeyOf(f.Value)
 		return ok
 	case FilterIn:
-		if f.Field == contentField {
+		if !indexNarrowable(f.Field, f.Op, poison) {
 			return false
 		}
 		switch f.Value.Kind {
 		case ValueStrings, ValueInts, ValueFloats:
 			return true
 		default:
+			// ValueRecord considered: falls here, correctly declining — a record
+			// is not an array, so FilterIn's index-exactness claim doesn't apply.
 			return false
 		}
 	case FilterGt, FilterGte, FilterLt, FilterLte:
-		if f.Field == contentField {
+		if !indexNarrowable(f.Field, f.Op, poison) {
 			return false
 		}
 		// Mirror orderingSet's own kind test: a want that can drive neither the
@@ -495,7 +503,7 @@ func filterIndexExact(f Filter) bool {
 		}
 		return f.Value.Kind == ValueString
 	case FilterDtGt, FilterDtGte, FilterDtLt, FilterDtLte:
-		if f.Field == contentField {
+		if !indexNarrowable(f.Field, f.Op, poison) {
 			return false
 		}
 		// datetimeBound is the SHARED lowering (compileDatetime calls it too), so
@@ -508,7 +516,7 @@ func filterIndexExact(f Filter) bool {
 			return false // an empty And matches everything; the index narrows nothing
 		}
 		for i := range f.And {
-			if !filterIndexExact(f.And[i]) {
+			if !filterIndexExact(f.And[i], poison) {
 				return false
 			}
 		}
@@ -651,7 +659,7 @@ func (h *hnsw) buildAdmitGate(s *layerScratch, f Filter, plan []narrowSet, k int
 	// re-checks the predicate.
 	exact := exactPlan &&
 		len(kept) == filterLeafCount(f) &&
-		filterIndexExact(f) &&
+		filterIndexExact(f, h.payloadIdx.badRecords) &&
 		h.arena.KeyDeadlineSlots() == 0
 	s.gate.build(kept, h.arena.Capacity(), exact || admitGateForceExact)
 	h.filterGates.Add(1)

@@ -210,6 +210,24 @@ func grpcError(err error) error {
 		// in the root rostam package (un-importable here without a cycle), so match
 		// the message prefix rather than the sentinel.
 		return status.Error(codes.InvalidArgument, err.Error())
+	case errIs(err, vector.ErrRecordTooLarge),
+		// vector.ErrRecordTooLarge: a payload carrying a record value above the
+		// storage cap. A caller mistake with a clear remedy (send a smaller
+		// record) whose message names only the payload key and the two sizes,
+		// all of which the caller sent — so InvalidArgument, mirroring
+		// server.clientFacingErr and httpapi.statusForError's 400 bucket for the
+		// same sentinel. Unclassified it fell to codes.Internal, which reads as a
+		// server fault and which standard gRPC retry policies hammer.
+		//
+		// Matched by sentinel AND by exact message shape: shard.decodePBResult
+		// rebuilds an op error with errors.New(string(payload)) across
+		// replication, so a clustered apply loses errors.Is identity — the same
+		// reason the other two classifiers carry a message-shape fallback. The
+		// fallback uses vector.IsRecordTooLargeMessage, NOT strings.Contains — a
+		// bare substring check would also match an unrelated internal error that
+		// merely wraps the sentinel, leaking it to the caller unredacted.
+		vector.IsRecordTooLargeMessage(err.Error()):
+		return status.Error(codes.InvalidArgument, err.Error())
 	case errIs(err, vector.ErrAPIKeyExists):
 		// Online key-admin: KeysAdd of an already-registered token. AlreadyExists
 		// (the etcd/gRPC create-conflict code) — the caller revokes first or picks a

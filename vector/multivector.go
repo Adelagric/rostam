@@ -3,6 +3,7 @@
 package vector
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -557,6 +558,9 @@ func (m *MultiVectorIndex) AddCASKeyTTLSparseAt(docID uint64, tokens [][]float32
 }
 
 func (m *MultiVectorIndex) addCASKeyTTLSparseBody(docID uint64, tokens [][]float32, meta Metadata, keyTTLMs map[string]int64, sparse *SparseVector, cas CASCond, stamped bool, nowMs int64) (uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return 0, err
+	}
 	if len(tokens) == 0 {
 		return 0, ErrEmptyDocument
 	}
@@ -673,6 +677,9 @@ func (m *MultiVectorIndex) addLockedAt(docID uint64, tokens [][]float32, meta Me
 // does NOT WAL-log. A version of 0 falls back to the normal bump (an old record
 // predating the version block defaults a fresh add to 1).
 func (m *MultiVectorIndex) restoreAdd(docID uint64, tokens [][]float32, meta Metadata, keyExpires map[string]uint64, version uint64, sparse *SparseVector) error {
+	if err := checkRecordValues(meta); err != nil {
+		return err
+	}
 	if len(tokens) == 0 {
 		return ErrEmptyDocument
 	}
@@ -739,6 +746,9 @@ func (m *MultiVectorIndex) restoreAdd(docID uint64, tokens [][]float32, meta Met
 // always wins (mirror of hnsw.InsertIfAbsent). Returns ErrDimMismatch / ErrEmptyDocument
 // on a malformed document, exactly as Add.
 func (m *MultiVectorIndex) AddIfAbsent(docID uint64, tokens [][]float32, meta Metadata) (inserted bool, err error) {
+	if err := checkRecordValues(meta); err != nil {
+		return false, err
+	}
 	if len(tokens) == 0 {
 		return false, ErrEmptyDocument
 	}
@@ -831,6 +841,9 @@ func (m *MultiVectorIndex) MultiAddIfAbsentVersion(docID uint64, tokens [][]floa
 func (m *MultiVectorIndex) MultiAddIfAbsentVersionSparse(docID uint64, tokens [][]float32, meta Metadata, keyExpires map[string]uint64, version uint64, sparse *SparseVector) (inserted bool, err error) {
 	if version == 0 && len(keyExpires) == 0 && (sparse == nil || sparse.IsZero()) {
 		return m.AddIfAbsent(docID, tokens, meta) // byte-for-byte the existing path (logs version 1)
+	}
+	if err := checkRecordValues(meta); err != nil {
+		return false, err
 	}
 	if len(tokens) == 0 {
 		return false, ErrEmptyDocument
@@ -995,7 +1008,7 @@ func (m *MultiVectorIndex) MultiRestoreAddSparse(docID uint64, tokens [][]float3
 // WAL-log: durability rides the Raft-replicated batch op that re-executes this on
 // replay (mirrors the dense bulk path), so callers must drive it through an op.
 func (m *MultiVectorIndex) MultiBulkBuild(recs []MultiScanRecord, workers int) (bool, error) {
-	for _, r := range recs {
+	for i, r := range recs {
 		if len(r.Tokens) == 0 {
 			return false, ErrEmptyDocument
 		}
@@ -1008,6 +1021,22 @@ func (m *MultiVectorIndex) MultiBulkBuild(recs []MultiScanRecord, workers int) (
 			if err := r.Sparse.Validate(); err != nil {
 				return false, err
 			}
+		}
+		// THIS ENTRY IS WIRE-REACHABLE and it is NOT a replay body, so it runs the
+		// record ingest gate. ops/mv_batch.go decodes a batch straight off the wire
+		// and calls it as the FAST PATH whenever the target index is empty,
+		// falling through to the gated MultiRestoreAddSparse only once documents
+		// exist — so without this the same op is gated or ungated depending on the
+		// target's emptiness, and the ungated case (a fresh partition) is exactly
+		// the one an offline MV resplit drives. The loop below writes r.Metadata
+		// into docMeta and reindexes it directly, with nothing else in front.
+		//
+		// The WHOLE batch is validated before m.mu is taken, so one bad record
+		// refuses every record rather than leaving a half-built index that can
+		// never use the fast path again. The offending row is named, exactly as
+		// checkRecordValuesAll names it for the dense bulk path.
+		if err := checkRecordValues(r.Metadata); err != nil {
+			return false, fmt.Errorf("payload %d: %w", i, err)
 		}
 	}
 	m.startSweeper()
@@ -1173,11 +1202,13 @@ func (m *MultiVectorIndex) applyDocSparseLocked(docID uint64, sparse *SparseVect
 }
 
 // Get retrieves a live document by id: its token matrix (each row a DEEP-COPIED
-// normalized token vector) and its metadata (deep-copied), plus ok. ok is false
+// normalized token vector) and its metadata (a map-level copy — see cloneMeta
+// and vtypes.Metadata for the slice-ownership contract), plus ok. ok is false
 // when docID is absent — the MV index has no tombstones or TTL, so a docID is live
 // iff it has a token-set entry (mirror Exists/ScanDocuments). The returned
-// tokens/payload are owned by the caller (mutating them never corrupts the inner
-// arena or docMeta). Lock order: m.mu (read) outer, then the inner index's own mu
+// tokens are owned by the caller, and so is the payload MAP (adding or removing
+// keys never corrupts docMeta); a slice-backed Value inside it still points at
+// stored bytes and must not be written through. Lock order: m.mu (read) outer, then the inner index's own mu
 // (taken internally by vecsForIDs) — the same outer→inner order Search/ScanDocuments use.
 func (m *MultiVectorIndex) Get(docID uint64) (tokens [][]float32, payload Metadata, version uint64, ok bool) {
 	m.mu.RLock()
@@ -1199,8 +1230,9 @@ func (m *MultiVectorIndex) Get(docID uint64) (tokens [][]float32, payload Metada
 			tokens = append(tokens, v) // already a fresh copy owned by us
 		}
 	}
-	// Drop per-key-TTL-expired keys, then deep-copy so the caller owns the payload
-	// (liveMetaMap may alias m.docMeta on the no-expiry fast path).
+	// Drop per-key-TTL-expired keys, then copy the map so the caller owns it
+	// (liveMetaMap may alias m.docMeta on the no-expiry fast path). Slice-backed
+	// Values inside still point at stored bytes — vtypes.Metadata's contract.
 	payload = cloneMeta(liveMetaMap(m.docMeta[docID], m.keyTTL[docID], m.nowMs()))
 	return tokens, payload, version, true
 }
@@ -1408,6 +1440,9 @@ func (m *MultiVectorIndex) setPayloadLocked(docID uint64, patch Metadata, keyTTL
 }
 
 func (m *MultiVectorIndex) setPayloadLockedAt(docID uint64, patch Metadata, keyTTLMs map[string]int64, cas CASCond, now int64) (Metadata, map[string]int64, uint64, error) {
+	if err := checkRecordValues(patch); err != nil {
+		return nil, nil, 0, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, exists := m.docTokens[docID]; !exists {
@@ -1566,6 +1601,9 @@ func (m *MultiVectorIndex) overwritePayloadLocked(docID uint64, meta Metadata, k
 }
 
 func (m *MultiVectorIndex) overwritePayloadLockedAt(docID uint64, meta Metadata, keyTTLMs map[string]int64, cas CASCond, now int64) (Metadata, map[string]int64, uint64, error) {
+	if err := checkRecordValues(meta); err != nil {
+		return nil, nil, 0, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, exists := m.docTokens[docID]; !exists {

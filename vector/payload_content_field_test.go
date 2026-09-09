@@ -182,11 +182,13 @@ func TestContentFieldOpsAgreeWithThePredicate(t *testing.T) {
 // posting-set lookup fails here with a precise message instead of somewhere
 // downstream with a count mismatch.
 func TestContentFieldIsNeverIndexNarrowable(t *testing.T) {
-	if indexNarrowable(contentField) {
-		t.Fatal("contentField must never be index-narrowable — reindex does not index it")
-	}
-	if !indexNarrowable("tag") {
-		t.Fatal("ordinary fields must stay narrowable")
+	for _, op := range []FilterOp{FilterEq, FilterIn, FilterGt, FilterContains, FilterMatch} {
+		if indexNarrowable(contentField, op, nil) {
+			t.Fatalf("contentField must never be index-narrowable (op %v) — reindex does not index it", op)
+		}
+		if !indexNarrowable("tag", op, nil) {
+			t.Fatalf("ordinary fields must stay narrowable (op %v)", op)
+		}
 	}
 
 	h := contentCorpus(t, 30)
@@ -220,13 +222,13 @@ func TestContentFieldIsNeverIndexNarrowable(t *testing.T) {
 	// collectEqTerms is the one that does NOT go through a *Set function — the
 	// eq branch indexes p.fields inline — so it needs its own guard and its own
 	// check.
-	if _, ok := collectEqTerms(Filter{Op: FilterEq, Field: contentField, Value: NewString("x")}); ok {
+	if _, ok := collectEqTerms(Filter{Op: FilterEq, Field: contentField, Value: NewString("x")}, nil); ok {
 		t.Error("collectEqTerms accepted a bare $content Eq")
 	}
 	terms, ok := collectEqTerms(Filter{Op: FilterAnd, And: []Filter{
 		{Op: FilterEq, Field: "tag", Value: NewString("a")},
 		{Op: FilterEq, Field: contentField, Value: NewString("x")},
-	}})
+	}}, nil)
 	if !ok || len(terms) != 1 || terms[0].field != "tag" {
 		t.Errorf("collectEqTerms should keep the tag term and drop the $content one, got ok=%v terms=%v", ok, terms)
 	}
