@@ -192,10 +192,9 @@ func (fr *pbFrameReader) read() (pbFrame, error) {
 	return f, nil
 }
 
-// Slim payload codecs for the batched transport: unlike net_codec.go's
-// encodeReplicateReq/decodeReplicateReq (which prefix the shard onto the
-// payload for the old unbatched transport), these omit the shard since it now
-// lives in the frame header. Layout (v2):
+// Slim payload codecs for the batched transport. These omit the shard from the
+// payload — it lives in the frame header (see pbFrame) rather than being
+// prefixed onto every message body. Layout (v2):
 // epoch(8) seq(8) prevSeq(8) prevEpoch(8) dataLen(4) data.
 
 // pbReplicateHdrSize is the fixed header of a single-write replicate payload.
