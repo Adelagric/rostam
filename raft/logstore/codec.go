@@ -118,6 +118,14 @@ func decodeInto(payload []byte, out *hraft.Log) error {
 	} else {
 		out.Extensions = append(out.Extensions[:0], p[:el]...)
 	}
+	p = p[el:]
+	// A record is sealed by its recLen frame + crc, so a well-formed payload ends
+	// exactly here. Any remaining bytes mean a misframed or corrupt record; reject
+	// it rather than silently dropping the tail — matching the trailing-bytes
+	// checks the wire decoders elsewhere already make (e.g. decodeReplicateGroup).
+	if len(p) != 0 {
+		return errCorrupt
+	}
 	return nil
 }
 

@@ -36,16 +36,10 @@ func FuzzDecodeInto(f *testing.F) {
 		if err := decodeInto(payload, &out); err != nil {
 			return
 		}
-		// Re-encoding the decoded entry must reproduce a PREFIX of the payload.
-		// NOTE decodeInto does NOT reject trailing bytes after the extensions
-		// field (unlike every other decoder in the tree — cf. decodeReplicateGroup's
-		// "trailing bytes" check), so a payload with junk past the last field
-		// decodes "successfully" and silently drops it. In production the recLen
-		// framing + crc seal each record, so this path never sees trailing bytes;
-		// this is a defense-in-depth / consistency gap, not an exploitable bug, so
-		// the invariant asserts a faithful prefix rather than full equality.
+		// decodeInto consumes the WHOLE payload (it rejects trailing bytes), so a
+		// payload it accepts must re-encode to exactly those bytes.
 		re := appendRecord(nil, &out)[frameHdr:]
-		if len(re) > len(payload) || !bytes.Equal(re, payload[:len(re)]) {
+		if !bytes.Equal(re, payload) {
 			t.Fatalf("decodeInto round-trip mismatch: in=%x out=%x", payload, re)
 		}
 	})
