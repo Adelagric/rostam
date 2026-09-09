@@ -42,9 +42,11 @@ func FuzzPBDecodeReplicateGroup(f *testing.F) {
 		{Epoch: 3, Seq: 10, PrevSeq: 9, PrevEpoch: 3, Data: []byte("a")},
 		{Epoch: 3, Seq: 11, PrevSeq: 10, PrevEpoch: 3, Data: []byte("bb")},
 	}))
-	// A hostile count with no records behind it must be rejected, not allocated.
+	// A hostile count far above pbGroupCountMax, with no records behind it, must
+	// be rejected outright rather than driving an allocation. count is the
+	// big-endian u32 at [32:36] of the group header.
 	big := make([]byte, pbGroupHdrSize)
-	big[35] = 0xff // count low byte; header is big-endian so this is a small count, still
+	binary.BigEndian.PutUint32(big[32:36], pbGroupCountMax+1)
 	f.Add(big)
 	f.Fuzz(func(t *testing.T, b []byte) {
 		msgs, err := decodeReplicateGroup(b)
