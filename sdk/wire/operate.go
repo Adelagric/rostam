@@ -16,6 +16,32 @@ import (
 // DecodeOperateArgs (a wire frame carrying one) — see design doc §3.5.
 var ErrOperateArgs = errors.New("wire: operate call arguments invalid")
 
+// IsOperateArgsMessage reports whether s is the EXACT serialised form of an
+// ErrOperateArgs error — the same exact-form matching ops.IsVectorRecordAbsent-
+// Message and vector.IsRecordTooLargeMessage do for their sentinels, and for the
+// same reason: an operate handler decodes its frame INSIDE the FSM apply, so on
+// a cluster the error comes back through shard.decodePBResult rebuilt with
+// errors.New, errors.Is identity is gone, and a sentinel-only classifier
+// redacts a client protocol mistake to "internal error".
+//
+// This sentinel has exactly ONE serialised shape: bare, no detail suffix and no
+// wrapper. Every server-side producer returns it unadorned — the wire decoders
+// and encoders in this package (DecodeOperateArgs, DecodeVectorOperateArgs and
+// their encoders) and ops (operate_apply.go's three guards,
+// checkVectorOperateArgs) all `return ..., ErrOperateArgs`. So exact equality is
+// the whole matcher, and it is deliberately not a strings.Contains: a bare
+// substring check would make any internal fault that merely mentions the
+// sentinel text client-facing.
+//
+// The ONE %w wrap in the tree, client.DecodeOperateValue's "N bytes left after
+// the tagged cell", is raised in the CLIENT process on a reply it is decoding.
+// It never reaches a server classifier, so it is correctly not matched here; if
+// a future server-side site does wrap the sentinel with context, add that exact
+// shape here, anchored, rather than loosening this to a substring.
+func IsOperateArgsMessage(s string) bool {
+	return s == ErrOperateArgs.Error()
+}
+
 // OperateSeg addresses one hop of an OperatePath (design doc §2.4/§3.5): a
 // field or column identified by its schema position, or, for a record that
 // stores names, by name.
@@ -367,14 +393,37 @@ func EncodeOperateArgs(a *OperateArgs) ([]byte, error) {
 // allows, over the byte budget is a truncated or lying frame. Decoded
 // Key/Schema/Bytes/Name/path-Key fields may alias b: the apply path only
 // reads them during one call and never retains them past it.
+//
+// TRAILING BYTES ARE REJECTED. A frame that decodes and leaves bytes over is not
+// the frame it claims to be, and the slack is not inert: the vector families
+// carry this blob inside a length-declared envelope
+// (DecodeVectorOperateArgs's [argsLen u32][args...]), so a caller could declare
+// a longer inner blob than it actually wrote and smuggle bytes past every
+// structural check into a frame the server otherwise accepted. Following
+// raft/logstore's decodeInto, the check is exact consumption rather than a
+// bound, and it closes the KV operate path (where args is the whole request
+// body) at the same time.
 func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
+	a, n, err := decodeOperateArgsN(b)
+	if err != nil {
+		return nil, err
+	}
+	if n != len(b) {
+		return nil, ErrOperateArgs
+	}
+	return a, nil
+}
+
+// decodeOperateArgsN is DecodeOperateArgs' body, reporting how many bytes it
+// consumed so the exported wrapper can insist that be all of them.
+func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 	if len(b) < 2 {
-		return nil, ErrShortArgs
+		return nil, 0, ErrShortArgs
 	}
 	klen := int(binary.BigEndian.Uint16(b[0:2]))
 	off := 2
 	if len(b)-off < klen {
-		return nil, ErrShortArgs
+		return nil, 0, ErrShortArgs
 	}
 	var key []byte
 	if klen > 0 {
@@ -383,11 +432,11 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 	off += klen
 
 	if len(b)-off < 8+1+1+2 { // ttlMs(8) + ttlMode(1) + create(1) + schemaLen(2)
-		return nil, ErrShortArgs
+		return nil, 0, ErrShortArgs
 	}
 	ttl, err := ttlFromMs(binary.BigEndian.Uint64(b[off : off+8]))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	off += 8
 	ttlMode := b[off]
@@ -395,16 +444,16 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 	create := b[off]
 	off++
 	if ttlMode > OperateTTLCreateOnly {
-		return nil, ErrOperateArgs
+		return nil, 0, ErrOperateArgs
 	}
 	if create > OperateCreateDynamic {
-		return nil, ErrOperateArgs
+		return nil, 0, ErrOperateArgs
 	}
 
 	schemaLen := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
 	if len(b)-off < schemaLen {
-		return nil, ErrShortArgs
+		return nil, 0, ErrShortArgs
 	}
 	var schema []byte
 	if schemaLen > 0 {
@@ -413,7 +462,7 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 	off += schemaLen
 
 	if len(b)-off < 2 {
-		return nil, ErrShortArgs
+		return nil, 0, ErrShortArgs
 	}
 	nOps := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
@@ -422,10 +471,10 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 	// than a call may carry), while a count the remaining bytes cannot
 	// possibly hold is a truncated frame.
 	if nOps > OperateMaxOps {
-		return nil, ErrOperateCap
+		return nil, 0, ErrOperateCap
 	}
 	if !CountFitsIn(nOps, len(b)-off, minOpBytes) {
-		return nil, ErrShortArgs
+		return nil, 0, ErrShortArgs
 	}
 	var ops []OperateOp
 	if nOps > 0 {
@@ -433,7 +482,7 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 		for i := 0; i < nOps; i++ {
 			op, n, oerr := decodeOp(b[off:])
 			if oerr != nil {
-				return nil, oerr
+				return nil, 0, oerr
 			}
 			ops = append(ops, op)
 			off += n
@@ -441,15 +490,15 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 	}
 
 	if len(b)-off < 2 {
-		return nil, ErrShortArgs
+		return nil, 0, ErrShortArgs
 	}
 	nRet := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
 	if nRet > OperateMaxRet {
-		return nil, ErrOperateCap
+		return nil, 0, ErrOperateCap
 	}
 	if !CountFitsIn(nRet, len(b)-off, minRetBytes) {
-		return nil, ErrShortArgs
+		return nil, 0, ErrShortArgs
 	}
 	var rets []OperateRet
 	if nRet > 0 {
@@ -457,7 +506,7 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 		for i := 0; i < nRet; i++ {
 			ret, n, rerr := decodeRet(b[off:])
 			if rerr != nil {
-				return nil, rerr
+				return nil, 0, rerr
 			}
 			rets = append(rets, ret)
 			off += n
@@ -472,7 +521,7 @@ func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
 		Schema:  schema,
 		Ops:     ops,
 		Rets:    rets,
-	}, nil
+	}, off, nil
 }
 
 // EncodeOperateResult encodes an operate result frame (design doc §3.4):
@@ -506,31 +555,47 @@ func EncodeOperateResult(r *OperateResult) ([]byte, error) {
 }
 
 // DecodeOperateResult reads a frame produced by EncodeOperateResult, with
-// the same truncation and bounded-count discipline as DecodeOperateArgs.
-// Decoded values may alias b.
+// the same truncation and bounded-count discipline as DecodeOperateArgs, and
+// the same exact-consumption rule: a frame that decodes and leaves bytes over
+// is rejected. DecodeVectorOperateResult carries this blob inside a declared
+// [resLen u32], so without the rule a result frame could over-declare its inner
+// length and carry bytes no decoder ever looks at. Decoded values may alias b.
 func DecodeOperateResult(b []byte) (*OperateResult, error) {
+	r, n, err := decodeOperateResultN(b)
+	if err != nil {
+		return nil, err
+	}
+	if n != len(b) {
+		return nil, ErrOperateArgs
+	}
+	return r, nil
+}
+
+// decodeOperateResultN is DecodeOperateResult's body, reporting how many bytes
+// it consumed so the exported wrapper can insist that be all of them.
+func decodeOperateResultN(b []byte) (*OperateResult, int, error) {
 	if len(b) < 1 {
-		return nil, ErrShortArgs
+		return nil, 0, ErrShortArgs
 	}
 	status := b[0]
 	if status != OperateStatusOK && status != OperateStatusCheckFailed {
 		// An unknown status byte changes the frame's own shape (only
 		// CHECK_FAILED carries failedOp), so accepting one would mean
 		// guessing at the layout of the bytes behind it.
-		return nil, ErrOperateArgs
+		return nil, 0, ErrOperateArgs
 	}
 	off := 1
 	var failedOp uint16
 	if status == OperateStatusCheckFailed {
 		if len(b)-off < 2 {
-			return nil, ErrShortArgs
+			return nil, 0, ErrShortArgs
 		}
 		failedOp = binary.BigEndian.Uint16(b[off : off+2])
 		off += 2
 	}
 
 	if len(b)-off < 2 {
-		return nil, ErrShortArgs
+		return nil, 0, ErrShortArgs
 	}
 	nRet := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
@@ -538,22 +603,22 @@ func DecodeOperateResult(b []byte) (*OperateResult, error) {
 	// cap is a frame declaring more values than a call may return,
 	// over the byte budget is a truncated or lying frame.
 	if nRet > OperateMaxRet {
-		return nil, ErrOperateCap
+		return nil, 0, ErrOperateCap
 	}
 	if !CountFitsIn(nRet, len(b)-off, 4) {
-		return nil, ErrShortArgs
+		return nil, 0, ErrShortArgs
 	}
 	var values [][]byte
 	if nRet > 0 {
 		values = make([][]byte, 0, nRet)
 		for i := 0; i < nRet; i++ {
 			if len(b)-off < 4 {
-				return nil, ErrShortArgs
+				return nil, 0, ErrShortArgs
 			}
 			vlen := int(binary.BigEndian.Uint32(b[off : off+4]))
 			off += 4
 			if vlen < 0 || len(b)-off < vlen {
-				return nil, ErrShortArgs
+				return nil, 0, ErrShortArgs
 			}
 			var val []byte
 			if vlen > 0 {
@@ -564,5 +629,5 @@ func DecodeOperateResult(b []byte) (*OperateResult, error) {
 		}
 	}
 
-	return &OperateResult{Status: status, FailedOp: failedOp, Values: values}, nil
+	return &OperateResult{Status: status, FailedOp: failedOp, Values: values}, off, nil
 }

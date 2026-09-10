@@ -96,6 +96,59 @@ for _, e := range errs { // nil/empty slice means everything succeeded
 }
 ```
 
+### Operating on a record
+
+`Collection.Operate` applies one atomic
+[`operate` op-list](../kv/overview.md#atomic-multi-field-updates-operate) to
+the record stored under one payload key of one point — see
+[updating a record in place](../vector/filtering.md#updating-a-record-in-place)
+for the full contract (what's rejected, what `create` does, the reshard
+refusal). Build the op-list with `client.NewOperate`, a two-statement pattern:
+build the args, check the build error, then call:
+
+```go
+args, err := client.NewOperate(nil).Dynamic().
+	AddT(client.F("hits"), wire.OperateTypeI64, 1).
+	Return(client.F("hits")).
+	Args() // Args() reports a build-time error (bad path, wrong type); nothing sent yet
+if err != nil { ... }
+
+found, res, version, err := posts.Operate(ctx, client.OperateRequest{
+	ID: 1, PayloadKey: "session", Args: args,
+})
+if err != nil {
+	return err
+}
+// found: false if the point is absent/tombstoned/expired — res is nil then, not
+// an error. Guard on it before touching res.
+if !found {
+	return nil
+}
+n, err := client.DecodeOperateValue(res.Values[0])
+```
+
+`version` is the point's version **after** the call, and it is what a CAS loop
+retries with. It is the bumped version when the op-list applied and the current,
+unbumped one when the call was a deliberate no-op (a failed `CHECK`). In both
+cases it can be fed straight into the next call's `ExpectedVersion` **without
+re-reading the point** — a re-read is both a round trip and a race, since another
+writer can land between it and the retry.
+
+Only a call that RETURNED carries a usable version. A call that fails with
+`ErrVersionConflict` returns `version == 0`: the server sends no result frame for
+a refused precondition, and `0` means "expect an absent point", so retrying with
+it conflicts again against a live point. Retry a conflict with the last version
+this collection handed you (from a successful or check-failed call) if you know
+no one else writes the point; otherwise re-read it, because the conflict means
+somebody did.
+
+`Collection.Operate` is **not replayable**: an ambiguous post-commit transport
+failure (the call may or may not have landed) surfaces as an error instead of
+being retried automatically, because a retried `ADD` after an ambiguous
+failure would double-count. A caller that needs at-most-once semantics across
+a retry should use `CHECK` in the op-list, or `OperateRequest.ExpectedVersion`
+to fence on the point's version.
+
 ### Reading
 
 ```go

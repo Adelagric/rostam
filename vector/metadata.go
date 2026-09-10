@@ -172,11 +172,156 @@ func (fl fieldLookup) get(m Metadata) (Value, bool) {
 // transports like ErrDimMismatch.
 var ErrRecordTooLarge = errors.New("vector: record payload value exceeds the storage cap")
 
-// checkRecordValues rejects a payload carrying an oversize ValueRecord. Every
-// mutation entry calls it BEFORE it touches any state or stages a WAL write;
-// the inner helpers those entries share deliberately do NOT repeat it, so each
-// op pays exactly one pass over its own payload.
+// recordTooLargeErr is the ONE producer of ErrRecordTooLarge's detailed form.
+// Every site that reports the record cap — the ingest gates checkRecordValues /
+// checkRecordValuesSize and the post-mutation bound in the four
+// mutatePayloadRecord bodies (vector/hnsw.go, vector/ivf.go, vector/named.go,
+// vector/multivector.go) — goes through it, so there is exactly one message
+// shape for IsRecordTooLargeMessage to anchor on.
+//
+// IT EXISTS BECAUSE THE COPIES DRIFTED. The four mutate bodies formatted their
+// own variant ("payload key %q would hold a %d-byte record"), and the two
+// differences were each a real defect: "would hold a" is not the " holds a "
+// the matcher anchors on, so a clustered apply — where shard.decodePBResult
+// rebuilds the error with errors.New and errors.Is identity is gone — declined
+// to classify it and redacted a fixable client mistake to "internal error";
+// and %q quoted an unbounded caller-supplied key, echoing up to ~65 KB of it
+// (DecodeVectorOperateArgs' payloadKey cap) straight back in the message.
+//
+// clipField (vector/filter.go) bounds the key at 64 source bytes for the second
+// reason, exactly as currentRecordValue and the two check helpers do: the key is
+// caller-supplied, and this message is returned VERBATIM to the caller on every
+// transport (a client error, classified 400 / InvalidArgument) and carried
+// across replication as a string.
+//
+// n is the size that was refused. Callers keep their own tense in surrounding
+// prose; the MESSAGE is fixed here and must not be re-phrased per site.
+func recordTooLargeErr(key string, n int) error {
+	return fmt.Errorf("%w: payload key %s holds a %d-byte record, the cap is %d bytes",
+		ErrRecordTooLarge, clipField(key), n, maxRecordValueBytes)
+}
+
+// recordMalformedErr is the ONE producer of ErrRecordMalformed's detailed form,
+// the twin of recordTooLargeErr and for the same two reasons: the message is
+// carried across replication as a string, so IsRecordMalformedMessage has to
+// anchor on ONE shape; and the key is caller-supplied, so it goes through
+// clipField rather than %q.
+//
+// err is what validateRecord (record.Validate) said about the bytes; it is
+// wrapped, not summarised, so the caller learns which part of the record could
+// not be opened. Both the ingest gate (checkRecordValues) and the four
+// post-mutation gates in the engine bodies raise it from here.
+func recordMalformedErr(key string, err error) error {
+	return fmt.Errorf("%w: payload key %s: %w", ErrRecordMalformed, clipField(key), err)
+}
+
+// checkRecordValues is the INGEST gate for every payload a caller supplies. It
+// rejects a ValueRecord that is oversize (ErrRecordTooLarge) or that no operate
+// engine could open (ErrRecordMalformed). Every wire-reachable mutation entry
+// calls it BEFORE it touches any state or stages a WAL write; the inner helpers
+// those entries share deliberately do NOT repeat it, so almost every op pays
+// exactly one pass over its own payload.
+//
+// TWO OPS PAY TWO PASSES, AND BOTH ARE LOAD-BEARING — see
+// TestRecordValidationCountPerWrite, which pins the count for every path.
+// UpsertCASKeyTTL[At] and StageBulkPayloads each do something IRREVERSIBLE
+// before the engine body they delegate to runs its own gate, so their pass
+// cannot be dropped or downgraded to size-only:
+//
+//   - Upsert is delete-then-insert. Its wrapper pass runs before
+//     idxDeleteLogged; without it a malformed record deletes the existing point
+//     and only then fails in insertBody, so a REJECTED write destroys the data it
+//     was replacing. TestMalformedRecordRejectedAtIngestDense fails exactly that
+//     way if the wrapper is downgraded.
+//   - BuildStaged hands the staged slices to the engine and CLEARS the stage
+//     buffer before BuildConcurrentMeta's gate runs, so a record that got past
+//     staging takes the caller's whole staged batch down with it.
+//     TestStagedBatchSurvivesARejectedRecord pins this.
+//
+// The duplicate pass costs one extra decode of the same bytes on those two paths
+// (BenchmarkCheckRecordValues sizes it). That is the price of failing before an
+// irreversible step, and it is the right trade: the alternative is losing a
+// point, or a batch, on a request that was refused.
+//
+// TWO CHECKS, TWO REACHES.
+//
+//   - The SIZE bound is one of two sites, and the divergence is deliberate: this
+//     one sees a CALLER's patch, while mutatePayloadRecordBody (vector/hnsw.go,
+//     with twins in vector/ivf.go and in the named/MV mutatePayloadRecordLockedAt)
+//     bounds the POST-mutation bytes the operate engine just produced, which no
+//     patch check can reach. Keep the two in step.
+//   - The SHAPE check (record.Validate) closes the poison hole phase 1 could only
+//     fail closed around: a record IndexEntries cannot enumerate but Resolve still
+//     answers from makes every path under that payload key decline to accelerate,
+//     for every point in the collection, and a later vector_operate on the same
+//     key fails with wire.ErrOperateRecord. Refusing it at the door costs the
+//     caller one error; accepting it costs the collection a payload key.
+//
+// WHY THE ORDER MATTERS: size first. An oversize value is refused without ever
+// being decoded, so a 16 MiB+1 payload cannot be used to make the gate itself
+// expensive.
+//
+// The replay bodies call checkRecordValuesSize instead — see its doc for which
+// ones and why.
 func checkRecordValues(m Metadata) error {
+	for k, v := range m {
+		if v.Kind != ValueRecord {
+			continue
+		}
+		// Both messages put the key through clipField, not %q: it is
+		// caller-supplied and bounded only by the route body cap, and both are
+		// returned VERBATIM to the caller on every transport (client errors,
+		// classified 400 / InvalidArgument) and carried across replication as a
+		// string. A short key renders exactly as %q did. Keep in step with
+		// checkRecordValuesSize.
+		if len(v.Rec) > maxRecordValueBytes {
+			return recordTooLargeErr(k, len(v.Rec))
+		}
+		if err := validateRecord(v.Rec); err != nil {
+			return recordMalformedErr(k, err)
+		}
+	}
+	return nil
+}
+
+// validateRecord is record.Validate behind a package-level indirection, so a test
+// can COUNT how many times one write decodes the same record bytes. The count is
+// a real invariant, not a curiosity: the shape check is O(record) with
+// allocations (see BenchmarkCheckRecordValues), so a path that silently grew a
+// third pass would multiply the write cost of every record-bearing payload with
+// nothing to show for it. TestRecordValidationCountPerWrite pins the number for
+// every ingest path and documents the two that are legitimately two.
+//
+// Swapped only by tests, never concurrently with a live write.
+var validateRecord = record.Validate
+
+// checkRecordValuesSize is checkRecordValues WITHOUT the shape check: the size
+// bound only. It is what the REPLAY bodies call — the ones whose metadata comes
+// from a WAL record or a snapshot this store already acked, never from a live
+// caller:
+//
+//	hnsw.restoreInsertBody / hnsw.RestorePayload
+//	ivf.restoreInsertBody  / ivf.RestorePayload
+//	NamedCollection.RestoreInsert (its only caller is named_wal.go replay)
+//	MultiVectorIndex.restoreAdd   (mv_wal.go replay; the WIRE entry above it,
+//	                               MultiRestoreAddSparse, does the full check)
+//
+// WHY REPLAY MUST NOT VALIDATE SHAPE. Replay's job is to rebuild state that was
+// already ACKNOWLEDGED. A shape check there could refuse a record written before
+// this gate existed and silently drop the write (named_wal.go and mv_wal.go
+// discard the restore error), turning a lost acceleration into lost data — a
+// strictly worse failure than the poison the gate prevents. The size bound is
+// safe to keep here because nothing the WAL or a snapshot can hold can fail it
+// (writeOptMeta refuses to encode an oversize record and readValue caps at
+// maxRecordValueBytes), so on these paths it can only ever fire for a caller
+// that reached the engine body directly.
+//
+// The WIRE-reachable members of the restore family are NOT in this list:
+// Collection.RestoreInsert/RestoreInsertAt (ops/builtin.go routes a wire insert
+// carrying a non-zero version to them) and MultiVectorIndex.MultiRestoreAddSparse
+// (ops/multivector.go, ops/mv_batch.go) carry the caller's own metadata, so they
+// run the full checkRecordValues like any other ingest entry.
+func checkRecordValuesSize(m Metadata) error {
 	for k, v := range m {
 		if v.Kind == ValueRecord && len(v.Rec) > maxRecordValueBytes {
 			// The key goes through clipField, not %q: it is caller-supplied and
@@ -184,8 +329,7 @@ func checkRecordValues(m Metadata) error {
 			// returned VERBATIM to the caller on every transport (it is a
 			// client error, classified 400 / InvalidArgument) and carried across
 			// replication as a string. A short key renders exactly as %q did.
-			return fmt.Errorf("%w: payload key %s holds a %d-byte record, the cap is %d bytes",
-				ErrRecordTooLarge, clipField(k), len(v.Rec), maxRecordValueBytes)
+			return recordTooLargeErr(k, len(v.Rec))
 		}
 	}
 	return nil
@@ -235,8 +379,10 @@ func checkRecordValuesAll(metas []Metadata) error {
 // Error())) is not silently redacted; the equality check cannot mis-fire on
 // anything else, so it costs nothing to include.
 //
-// Phase 2 adds the same treatment for ErrRecordMalformed, ErrPayloadKeyNotRecord,
-// and ErrVectorRecordAbsent; this helper does not attempt those.
+// IsRecordMalformedMessage, in this file, gives ErrRecordMalformed the same
+// treatment. ErrPayloadKeyNotRecord (vector.IsPayloadKeyNotRecordMessage, in
+// record_mutate.go) and ErrVectorRecordAbsent (ops.IsVectorRecordAbsentMessage,
+// in ops/vector_operate.go) get their own matchers next to their sentinels.
 func IsRecordTooLargeMessage(s string) bool {
 	if len(s) == 0 || len(s) > maxRecordTooLargeMessageLen {
 		return false
@@ -313,6 +459,105 @@ func hasRecordTooLargeSuffix(s string) bool {
 		return false
 	}
 	return strings.HasSuffix(rest[:i], recordTooLargeSuffixMid)
+}
+
+// IsRecordMalformedMessage reports whether s is the EXACT serialised form of
+// an ErrRecordMalformed error produced by checkRecordValues (single-payload)
+// or checkRecordValuesAll (bulk) — anchored on the fixed prefix/marker text
+// those two produce, exactly as IsRecordTooLargeMessage is for its sentinel,
+// and for the same reason: shard.decodePBResult rebuilds a replicated op
+// error with errors.New, losing errors.Is identity, and a bare
+// strings.Contains fallback would make any error whose message happens to
+// mention the sentinel text client-facing — including an internal error that
+// merely wraps it.
+//
+// The three recognized shapes (<key> is clipField's bounded rendering of the
+// caller's payload key; <detail> is validateRecord's — i.e. record.Validate's
+// — own message for what DecodeRecord rejected, e.g. "unexpected EOF"):
+//
+//	vector: record payload value is not a decodable operate record
+//	vector: record payload value is not a decodable operate record: payload key <key>: record: malformed record: <detail>
+//	payload I: vector: record payload value is not a decodable operate record: payload key <key>: record: malformed record: <detail>
+//
+// UNLIKE IsRecordTooLargeMessage, the tail after the fixed "record: malformed
+// record: " marker has no fixed closing suffix to anchor on — record.Validate
+// wraps whatever wire.DecodeRecord's own error says, which is not one fixed
+// shape. This matcher therefore requires only that the marker appear
+// somewhere after the fixed prefix and that SOME non-empty text follow it; it
+// does not attempt to bound or validate the detail itself. That is still safe
+// against the redaction-bypass this exists to close: an unrelated error (a
+// WAL/path/IO failure, say) would have to independently reproduce the exact,
+// highly specific opening text before falling through to an arbitrary tail,
+// which an accidental wrap around the sentinel cannot do — a wrap always adds
+// its OWN text as a prefix, which fails the exact-prefix check below.
+func IsRecordMalformedMessage(s string) bool {
+	if len(s) == 0 || len(s) > maxRecordMalformedMessageLen {
+		return false
+	}
+	if s == ErrRecordMalformed.Error() {
+		return true
+	}
+	rest, ok := cutRecordMalformedPrefix(s)
+	if !ok {
+		return false
+	}
+	return hasRecordMalformedSuffix(rest)
+}
+
+// maxRecordMalformedMessageLen bounds the input IsRecordMalformedMessage
+// scans, so classification cost cannot scale with an attacker-chosen string's
+// length. Mirrors maxRecordTooLargeMessageLen's reasoning; sized a little
+// larger to leave headroom for record.Validate's detail text.
+const maxRecordMalformedMessageLen = 2048
+
+// recordMalformedPrefix is the fixed text that opens the single-payload form,
+// ending right before the caller-controlled clipField(k) rendering.
+var recordMalformedPrefix = ErrRecordMalformed.Error() + ": payload key "
+
+// recordMalformedMidMarker is the fixed text that separates the
+// caller-controlled key rendering from record.Validate's own detail: the
+// wrapped record.ErrRecord sentinel, colon-space delimited on both sides.
+var recordMalformedMidMarker = ": " + record.ErrRecord.Error() + ": "
+
+// cutRecordMalformedPrefix strips either the single-payload prefix or the
+// bulk "payload <digits>: " wrapper followed by the single-payload prefix,
+// and returns what follows (the clipField rendering, the mid marker, and
+// record.Validate's detail). Structurally identical to
+// cutRecordTooLargePrefix, duplicated rather than shared because the two
+// prefixes differ.
+func cutRecordMalformedPrefix(s string) (string, bool) {
+	if rest, ok := strings.CutPrefix(s, recordMalformedPrefix); ok {
+		return rest, true
+	}
+	rest, ok := strings.CutPrefix(s, "payload ")
+	if !ok {
+		return "", false
+	}
+	i := 0
+	for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return "", false
+	}
+	rest, ok = strings.CutPrefix(rest[i:], ": ")
+	if !ok {
+		return "", false
+	}
+	return strings.CutPrefix(rest, recordMalformedPrefix)
+}
+
+// hasRecordMalformedSuffix reports whether s contains the fixed mid marker
+// somewhere after the caller-controlled key rendering, followed by at least
+// one byte of record.Validate's detail. Unlike hasRecordTooLargeSuffix there
+// is no fixed tail to anchor the far end on (see IsRecordMalformedMessage's
+// doc for why that is still safe).
+func hasRecordMalformedSuffix(s string) bool {
+	i := strings.Index(s, recordMalformedMidMarker)
+	if i < 0 {
+		return false
+	}
+	return i+len(recordMalformedMidMarker) < len(s)
 }
 
 // recordPoison is the READ side of the payload index's per-payload-key

@@ -746,6 +746,13 @@ func (c *Collection) StageBulk(ids []uint64, vecs [][]float32) error {
 // point. Everything StageBulk documents about dimension checking applies here
 // unchanged.
 func (c *Collection) StageBulkPayloads(ids []uint64, vecs [][]float32, metas []Metadata) error {
+	// THE FULL GATE, HERE, EVEN THOUGH BuildConcurrentMeta RUNS IT AGAIN.
+	// BuildStaged takes the staged slices and CLEARS the buffer before it calls
+	// the engine, so a record that got past staging is discovered with the
+	// caller's whole staged batch already gone. Rejecting at stage time keeps the
+	// buffer intact and names the offending row while the caller can still fix it
+	// — the same reason the dimension check is here rather than only in the
+	// builder. See TestStagedBatchSurvivesARejectedRecord.
 	if err := checkRecordValuesAll(metas); err != nil {
 		return err
 	}
@@ -838,6 +845,13 @@ func (c *Collection) UpsertCAS(id uint64, vec []float32, content string, ttl tim
 // deadlines; the WAL logs them so replay restores them verbatim. Empty/nil
 // keyTTLMs is the zero-overhead path.
 func (c *Collection) UpsertCASKeyTTL(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond) (uint64, error) {
+	// THE FULL GATE, HERE, EVEN THOUGH insertBody RUNS IT AGAIN. Upsert is
+	// delete-then-insert, and the delete below is irreversible: downgrade this to
+	// checkRecordValuesSize and a malformed record deletes the existing point and
+	// only THEN fails inside c.idx.Insert, so a REFUSED write destroys the data it
+	// was replacing. That is the one shape of this bug that is worse than the
+	// poison the gate prevents, so this path decodes the record twice on purpose.
+	// See checkRecordValues' doc and TestRecordValidationCountPerWrite.
 	if err := checkRecordValues(meta); err != nil {
 		return 0, err
 	}
@@ -1232,6 +1246,43 @@ func (c *Collection) ClearPayloadCASAt(id uint64, cas CASCond, nowMs int64) (uin
 	}, id)
 }
 
+// MutatePayloadRecordCAS applies fn to the operate record stored under key in
+// id's payload, atomically with the CAS check and the version bump, and WAL-logs
+// the RESULTING payload (a replace, not a merge) exactly as every other payload
+// mutation does. A deliberate no-op — fn reporting RecordUnchanged (a failed
+// CHECK), or a delete of an already-absent key — writes no WAL record and
+// returns the current, unbumped version. Returns ErrIDNotFound for a dead point,
+// ErrVersionConflict on a CAS mismatch, ErrPayloadKeyNotRecord when the key
+// holds a non-record value, ErrRecordTooLarge when the resulting record exceeds
+// the storage cap, and fn's own error verbatim — in every case with the point
+// left exactly as it was.
+//
+// THE KEY'S DEADLINE IS NOT CONSULTED HERE. Unstamped, `now` is this process's
+// own wall clock, and letting it decide whether the record EXISTS would let two
+// replicas store different bytes. So an unstamped mutation treats a
+// deadline-passed record as PRESENT and passes its deadline through untouched;
+// only the *At variant expires the key. See recordKeyPastDeadline
+// (vector/record_mutate.go).
+func (c *Collection) MutatePayloadRecordCAS(id uint64, key string, fn RecordMutator, cas CASCond) (uint64, error) {
+	return c.payloadOpCASChanged(cas, func(cc CASCond) (Metadata, map[string]uint64, uint64, bool, error) {
+		return c.idx.MutatePayloadRecord(id, key, fn, cc)
+	}, id)
+}
+
+// MutatePayloadRecordCASAt is MutatePayloadRecordCAS under a leader apply stamp:
+// the engine judges the dead-point liveness gate, the per-key deadline check and
+// the stale-deadline drop against nowMs, so every replica reads the same record
+// and stores the same bytes (#4 vector TTL determinism).
+//
+// This is the ONLY variant that may expire the payload key: its clock is the
+// leader's stamp, identical on every replica. See recordKeyPastDeadline
+// (vector/record_mutate.go) for why the unstamped twin must not.
+func (c *Collection) MutatePayloadRecordCASAt(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (uint64, error) {
+	return c.payloadOpCASChanged(cas, func(cc CASCond) (Metadata, map[string]uint64, uint64, bool, error) {
+		return c.idx.MutatePayloadRecordAt(id, key, fn, cc, nowMs)
+	}, id)
+}
+
 // DeleteCASAt is DeleteCAS judging the dead-slot liveness gate against the leader
 // apply stamp nowMs, so replicas agree on already-dead vs live and keep identical
 // tombstone sets (#4 vector TTL determinism).
@@ -1312,6 +1363,9 @@ func (c *Collection) DeleteByFilterAt(filter Filter, nowMs int64) (int, error) {
 // precheck + unconditional delete), then re-inserts via InsertAt so the point/per-key
 // deadlines are stamped identically on every replica (#4 vector TTL determinism).
 func (c *Collection) UpsertCASKeyTTLAt(id uint64, vec []float32, content string, ttl time.Duration, meta Metadata, sparse *SparseVector, keyTTLMs map[string]int64, cas CASCond, nowMs int64) (uint64, error) {
+	// The full gate before the tombstone, for the reason UpsertCASKeyTTL states:
+	// this path deletes before it inserts, so a size-only check here would let a
+	// malformed record destroy the point it was refused from replacing.
 	if err := checkRecordValues(meta); err != nil {
 		return 0, err
 	}
@@ -1379,40 +1433,64 @@ func (c *Collection) UpsertCASKeyTTLAt(id uint64, vec []float32, content string,
 	return version, nil
 }
 
-// payloadOpCAS is the shared CAS-aware payload-mutation core: it runs the engine
-// op (which enforces the CAS precondition + bumps the version) and, on a WAL-mode
-// collection, logs the resulting payload + per-key deadlines + version under opMu.
-// Returns the resulting version; ErrVersionConflict (or ErrIDNotFound) propagate
-// from the engine with no WAL append.
-func (c *Collection) payloadOpCAS(cas CASCond, op func(CASCond) (Metadata, map[string]uint64, uint64, error), id uint64) (uint64, error) {
+// payloadOpCASChanged is payloadOpCAS for an op that may legitimately apply
+// NOTHING (a record mutation whose CHECK failed): when op reports changed=false
+// the version it returns is the current, unbumped one, and no WAL record is
+// staged — a no-op must not cost a log entry or move a version a CAS loop is
+// watching.
+//
+// opMu is held across {apply + WAL WRITE} only, scoped to a closure (see
+// InsertCASKeyTTL) so a panic inside op or the WAL append still unlocks opMu via
+// the deferred Unlock instead of leaking it forever. The durability wait runs
+// outside opMu so concurrent payload writers group-commit instead of each paying
+// a serialized fsync under the collection's op lock.
+func (c *Collection) payloadOpCASChanged(cas CASCond, op func(CASCond) (Metadata, map[string]uint64, uint64, bool, error), id uint64) (uint64, error) {
 	if c.wal == nil {
-		_, _, version, err := op(cas)
+		_, _, version, _, err := op(cas)
 		return version, err
 	}
-	// opMu is held across {apply + WAL WRITE} only, scoped to a closure (see
-	// InsertCASKeyTTL) so a panic inside op or the WAL append still unlocks opMu
-	// via the deferred Unlock instead of leaking it forever. The durability wait
-	// runs outside opMu so concurrent payload writers group-commit instead of
-	// each paying a serialized fsync under the collection's op lock.
 	var seq, version uint64
+	var changed bool
 	err := func() error {
 		c.opMu.Lock()
 		defer c.opMu.Unlock()
-		resulting, ke, v, err := op(cas)
+		resulting, ke, v, ch, err := op(cas)
 		if err != nil {
 			return err
 		}
-		version = v
+		version, changed = v, ch
+		if !ch {
+			return nil
+		}
 		seq, err = c.wal.appendSetPayloadStaged(id, resulting, ke, v)
 		return err
 	}()
 	if err != nil {
 		return 0, err
 	}
+	if !changed {
+		return version, nil
+	}
 	if err := c.wal.commitWaitStaged(seq); err != nil {
 		return 0, err
 	}
 	return version, nil
+}
+
+// payloadOpCAS is the shared CAS-aware payload-mutation core: it runs the engine
+// op (which enforces the CAS precondition + bumps the version) and, on a WAL-mode
+// collection, logs the resulting payload + per-key deadlines + version under opMu.
+// Returns the resulting version; ErrVersionConflict (or ErrIDNotFound) propagate
+// from the engine with no WAL append.
+//
+// It is the always-changed form every payload mutation other than the record
+// mutator takes. Behaviour-preserving: payloadOpCASChanged tests err before it
+// reads changed, so the hard-coded true is never consulted on an error path.
+func (c *Collection) payloadOpCAS(cas CASCond, op func(CASCond) (Metadata, map[string]uint64, uint64, error), id uint64) (uint64, error) {
+	return c.payloadOpCASChanged(cas, func(cc CASCond) (Metadata, map[string]uint64, uint64, bool, error) {
+		m, ke, v, err := op(cc)
+		return m, ke, v, true, err
+	}, id)
 }
 
 // replayWAL re-applies a WAL's records onto the (just-restored) index. Apply

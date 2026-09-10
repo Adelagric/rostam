@@ -10,6 +10,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -112,4 +114,216 @@ func TestGrpcErrorRecordTooLarge(t *testing.T) {
 			t.Errorf("%s: grpcError = %v, want Internal", tc.name, got)
 		}
 	}
+}
+
+// errRealMalformedSingle, errRealMalformedBulk and errRealNotRecordDetailed reproduce
+// the EXACT shapes checkRecordValues / checkRecordValuesAll (ErrRecordMalformed)
+// and currentRecordValue (ErrPayloadKeyNotRecord) actually produce in
+// production — see vector.IsRecordMalformedMessage / IsPayloadKeyNotRecordMessage
+// for the format strings these mirror. grpcapi cannot call those unexported
+// vector-package producers directly, so the shapes are reproduced by hand;
+// vector's own TestIsRecordMalformedMessage / TestIsPayloadKeyNotRecordMessage
+// pin them against the real producers.
+var (
+	errRealMalformedSingle   = fmt.Errorf("%w: payload key %q: %s", vector.ErrRecordMalformed, "session", "record: malformed record: wire: args too short")
+	errRealMalformedBulk     = fmt.Errorf("payload %d: %w", 7, errRealMalformedSingle)
+	errRealNotRecordDetailed = fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)
+)
+
+// TestGrpcErrorVectorRecordMalformedAndPayloadKeyNotRecord pins the gRPC
+// transport's classification of vector_operate's two ingest/shape refusals —
+// vector.ErrRecordMalformed and vector.ErrPayloadKeyNotRecord — as
+// InvalidArgument, mirroring server.clientFacingErr / httpapi.statusForError's
+// 400 bucket for the same sentinels (PR #102 found these unclassified here,
+// falling through to codes.Internal). vector.ErrRecordTooLarge shares the
+// bucket and is pinned by TestGrpcErrorRecordTooLarge above.
+//
+// Per error: the bare sentinel (errIs), the real %w-wrapped shape (matched by
+// errIs regardless of exact text — identity survives an in-process %w wrap),
+// and that same shape stringified across the Raft boundary (matched only by
+// the message-shape matcher, since shard.decodePBResult rebuilds a replicated
+// op error with errors.New and errors.Is stops matching there).
+func TestGrpcErrorVectorRecordMalformedAndPayloadKeyNotRecord(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"malformed-sentinel", vector.ErrRecordMalformed},
+		{"malformed-wrapped, real single-payload shape", errRealMalformedSingle},
+		{"malformed-wrapped, real bulk shape", errRealMalformedBulk},
+		{"malformed-stringified across replication, real single-payload shape", errors.New(errRealMalformedSingle.Error())},
+		{"malformed-stringified across replication, real bulk shape", errors.New(errRealMalformedBulk.Error())},
+		{"not-record-sentinel", vector.ErrPayloadKeyNotRecord},
+		{"not-record-wrapped, real detailed shape", errRealNotRecordDetailed},
+		{"not-record-stringified across replication, real detailed shape", errors.New(errRealNotRecordDetailed.Error())},
+		{"not-record-stringified across replication, bare shape", errors.New(vector.ErrPayloadKeyNotRecord.Error())},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != codes.InvalidArgument {
+				t.Errorf("grpcError(%v) = %v, want InvalidArgument", tc.err, got)
+			}
+		})
+	}
+	// Negative controls: an unrelated internal fault must still be Internal,
+	// including one that merely CONTAINS the sentinel text inside an unrelated
+	// wrapper — the exact redaction bypass a bare strings.Contains classifier
+	// reintroduces (it would leak the WAL path below to the caller). Before this
+	// fix these two cases were misclassified InvalidArgument.
+	negatives := []struct {
+		name string
+		err  error
+	}{
+		{"unrelated fault wrapping ErrRecordMalformed (%v, no %w identity)",
+			fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordMalformed)},
+		{"unrelated fault wrapping ErrPayloadKeyNotRecord (%v, no %w identity)",
+			fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrPayloadKeyNotRecord)},
+	}
+	for _, tc := range negatives {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != codes.Internal {
+				t.Errorf("grpcError(%v) = %v, want Internal", tc.err, got)
+			}
+		})
+	}
+}
+
+// TestGrpcErrorVectorRecordAbsentIsNotFound pins vector_operate's create=NONE
+// refusal (ops.ErrVectorRecordAbsent) as NotFound over gRPC, the same status
+// server.mapResult (StatusNotFound) and httpapi.statusForError (404) answer
+// for the identical signal — every transport tells the caller the same thing
+// for a record that simply is not there.
+//
+// ErrVectorRecordAbsent, unlike the vector-package sentinels above, has
+// exactly ONE production shape — bare, never wrapped (see
+// ops.IsVectorRecordAbsentMessage's doc: every caller propagates it verbatim).
+// "wrapped" here is therefore a synthetic %w wrap that exercises errIs's
+// identity match, not a real production shape; "stringified" is the bare form
+// re-created with errors.New, the real clustered-apply shape.
+func TestGrpcErrorVectorRecordAbsentIsNotFound(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ops.ErrVectorRecordAbsent},
+		{"wrapped (synthetic %w, exercises errIs identity — production never wraps this sentinel)",
+			fmt.Errorf("shard 3: %w", ops.ErrVectorRecordAbsent)},
+		{"stringified across replication, real bare shape", errors.New(ops.ErrVectorRecordAbsent.Error())},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != codes.NotFound {
+				t.Errorf("grpcError(%v) = %v, want NotFound", tc.err, got)
+			}
+		})
+	}
+	// Negative control: an unrelated internal fault that merely wraps the
+	// sentinel with its OWN prefix text must stay Internal — a bare
+	// strings.Contains classifier would leak it as NotFound instead (the exact
+	// redaction bypass this replaces "apply: "+err.Error() with an exact-form
+	// matcher to close).
+	t.Run("unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + ops.ErrVectorRecordAbsent.Error())
+		if got := status.Code(grpcError(err)); got != codes.Internal {
+			t.Errorf("grpcError(%v) = %v, want Internal", err, got)
+		}
+	})
+}
+
+// TestGrpcErrorOperateDuringReshardIsUnavailable pins the reshard refusal as
+// Unavailable over gRPC — the code standard retry policies and service meshes DO
+// retry — matching HTTP's 503 and the binary transport's client-facing
+// StatusError for the identical signal. Unclassified it fell to Internal, which
+// those same policies hammer or hard-fail, for a condition that clears itself at
+// cutover.
+//
+// A negative control asserts an unrelated fault that merely wraps the refusal
+// text with a foreign prefix stays Internal.
+func TestGrpcErrorOperateDuringReshardIsUnavailable(t *testing.T) {
+	detailed := ops.OperateDuringReshardErr("docs")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ops.ErrOperateDuringReshard},
+		{"production detailed form (names the collection)", detailed},
+		{"wrapped (%w, exercises errIs identity)", fmt.Errorf("shard 3: %w", ops.ErrOperateDuringReshard)},
+		{"stringified across replication, bare shape", errors.New(ops.ErrOperateDuringReshard.Error())},
+		{"stringified across replication, detailed shape", errors.New(detailed.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != codes.Unavailable {
+				t.Errorf("grpcError(%v) = %v, want Unavailable", tc.err, got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the refusal with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + detailed.Error())
+		if got := status.Code(grpcError(err)); got != codes.Internal {
+			t.Errorf("grpcError(%v) = %v, want Internal", err, got)
+		}
+	})
+}
+
+// TestGrpcErrorMalformedOperateFrameIsInvalidArgument pins a malformed operate
+// frame as InvalidArgument, matching HTTP's 400 and the binary transport's
+// client-facing answer for the same sentinel. Unclassified it fell to Internal,
+// which reads as a server fault for a frame the caller built. KV operate raises
+// the same sentinel from the same decoder, so this arm covers both ops.
+func TestGrpcErrorMalformedOperateFrameIsInvalidArgument(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrOperateArgs},
+		{"wrapped (%w, exercises errIs identity)", fmt.Errorf("vector_operate: %w", wire.ErrOperateArgs)},
+		// The clustered shape, and the one the sentinel arm cannot reach: an
+		// operate handler decodes inside the FSM apply, so shard.decodePBResult
+		// hands the error back rebuilt with errors.New and identity is gone.
+		{"stringified across replication, real bare shape", errors.New(wire.ErrOperateArgs.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != codes.InvalidArgument {
+				t.Errorf("grpcError(%v) = %v, want InvalidArgument", tc.err, got)
+			}
+		})
+	}
+	// Negative control: an unrelated internal fault that merely mentions the
+	// sentinel text must stay Internal — what exact equality buys over a
+	// strings.Contains arm.
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrOperateArgs.Error())
+		if got := status.Code(grpcError(err)); got != codes.Internal {
+			t.Errorf("grpcError(%v) = %v, want Internal", err, got)
+		}
+	})
+}
+
+// TestGrpcErrorTruncatedOperateFrameIsInvalidArgument is the parity guard for
+// wire.ErrVectorArgsTruncated: the sentinel DecodeVectorOperateArgs raises for a
+// frame shorter than the fields it declares, beside the ErrOperateArgs it raises
+// for a complete-but-invalid one. Both are the caller's framing mistake, so both
+// answer InvalidArgument here, matching HTTP's 400 and the binary transport's
+// client-facing message.
+func TestGrpcErrorTruncatedOperateFrameIsInvalidArgument(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrVectorArgsTruncated},
+		{"wrapped (%w, exercises errIs identity)", fmt.Errorf("vector_operate: %w", wire.ErrVectorArgsTruncated)},
+		{"stringified across replication, real bare shape", errors.New(wire.ErrVectorArgsTruncated.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(grpcError(tc.err)); got != codes.InvalidArgument {
+				t.Errorf("grpcError(%v) = %v, want InvalidArgument", tc.err, got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrVectorArgsTruncated.Error())
+		if got := status.Code(grpcError(err)); got != codes.Internal {
+			t.Errorf("grpcError(%v) = %v, want Internal", err, got)
+		}
+	})
 }

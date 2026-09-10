@@ -210,7 +210,7 @@ func (c *Client) Call(ctx context.Context, op string, args []byte) ([]byte, erro
 		// another server and retry within the hop budget — but never
 		// replay a non-replayable conditional write across an ambiguous
 		// (post-transmission) failure, which could report a wrong outcome.
-		if isTransportError(err) && hop < maxHops && !(nonReplayableOp(op) && isAmbiguous(err)) {
+		if isTransportError(err) && hop < maxHops && !(nonReplayableCall(op, args) && isAmbiguous(err)) {
 			next := c.nextServer()
 			if next != "" && next != target {
 				target = next
@@ -539,12 +539,61 @@ func (e *ambiguousError) Unwrap() error { return e.err }
 // server-side CAS), so a blind replay after an ambiguous post-commit failure
 // would apply every increment twice; it surfaces the ambiguous error instead,
 // exactly like "incr_ex".
+// "vector_operate" and its named / multi-vector twins are the SAME op-list
+// applied to a record held inside a POINT's payload instead of under a KV key,
+// so they inherit "operate"'s reasoning verbatim: a replayed ADD double-counts,
+// and a replayed CHECK is evaluated against a record the first attempt already
+// changed. They are listed individually rather than matched by a "vector_"
+// prefix so a future read-only vector op cannot be swept in by accident.
 func nonReplayableOp(op string) bool {
 	switch op {
-	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush", "__flush_shard__", "operate":
+	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush", "__flush_shard__", "operate",
+		"vector_operate", "vector_named_operate", "vector_mv_operate":
 		return true
 	}
 	return false
+}
+
+// nonReplayableCall is nonReplayableOp seen THROUGH the write-consistency
+// envelope, and it is what the two retry decisions call — never nonReplayableOp
+// directly.
+//
+// WHY THE ENVELOPE HAD TO BE LOOKED THROUGH. A write issued with active
+// write-consistency options is not sent under its own name: the store wraps it
+// (wcWire, root package) so the server's fanout dispatcher can run the
+// post-commit barrier, and the name on the wire becomes wire.WCEnvelopeOp. A
+// guard keyed on that name alone answers false for EVERY op, so exactly the
+// conditional writes the guard exists for — a vector_operate ADD, an incr_ex, a
+// cas — were retried across an ambiguous post-transmission failure and could
+// apply twice. The envelope changes how a write is COMMITTED, never whether
+// replaying it is safe, so the classification has to follow the inner op.
+//
+// An envelope whose head does not decode is treated as non-replayable. This
+// client never builds such a frame, so it is either corruption or a caller
+// hand-rolling one; declining to retry it costs at most one retry, while
+// guessing "replayable" costs a double-applied write.
+func nonReplayableCall(op string, args []byte) bool {
+	if nonReplayableOp(op) {
+		return true
+	}
+	if op != wire.WCEnvelopeOp {
+		return false
+	}
+	inner, ok := wire.WCEnvelopeInnerOp(args)
+	if !ok {
+		return true
+	}
+	// A NESTED envelope is non-replayable outright. The server's fanout
+	// dispatcher unwraps the envelope and dispatches whatever is inside, so a
+	// frame wrapping a second envelope eventually reaches some real write, and
+	// this guard cannot see which one without decoding an unbounded chain. This
+	// client never builds a nested frame — wcWire wraps exactly once — so
+	// declining is free, while recursing would let a hand-built frame choose how
+	// much work the classification does.
+	if inner == wire.WCEnvelopeOp {
+		return true
+	}
+	return nonReplayableOp(inner)
 }
 
 // isAmbiguous reports whether err is (or wraps) an ambiguousError — a
@@ -742,7 +791,7 @@ func (c *Client) CallFunc(ctx context.Context, op string, args []byte, fn func(p
 		}
 		// See Call: a non-replayable conditional write is not retried across
 		// an ambiguous (post-transmission) transport failure.
-		if isTransportError(err) && hop < maxHops && !(nonReplayableOp(op) && isAmbiguous(err)) {
+		if isTransportError(err) && hop < maxHops && !(nonReplayableCall(op, args) && isAmbiguous(err)) {
 			next := c.nextServer()
 			if next != "" && next != target {
 				target = next

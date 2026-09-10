@@ -27,6 +27,7 @@ import (
 	"github.com/rostamlabs/rostam/grpcapi/grpcsvc"
 	"github.com/rostamlabs/rostam/ops"
 	"github.com/rostamlabs/rostam/sdk/pb"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -194,6 +195,37 @@ func grpcError(err error) error {
 		// TextSearch/HybridTextSearch on a collection without FullText: a usage error.
 		vector.ErrFullTextDisabled):
 		return status.Error(codes.InvalidArgument, err.Error())
+	case errIs(err, wire.ErrOperateArgs),
+		// The clustered path stringifies the sentinel across the Raft boundary:
+		// an operate handler decodes its frame INSIDE the FSM apply, so
+		// shard.decodePBResult rebuilds the error with errors.New and errors.Is
+		// stops matching — which left a malformed frame from a clustered caller
+		// redacted as a server fault, the one case the sentinel arm above cannot
+		// reach. wire.IsOperateArgsMessage, not strings.Contains: a bare
+		// substring check would also match an unrelated internal error that
+		// merely wraps the sentinel, leaking it unredacted.
+		//
+		// wire.ErrVectorArgsTruncated rides in the same bucket, by both arms, for
+		// the same reasons: DecodeVectorOperateArgs raises it for a frame shorter
+		// than the fields it declares, right beside the ErrOperateArgs it raises
+		// for a complete-but-invalid one. Both are the caller's framing mistake
+		// and both name nothing but "the arguments do not decode"; left
+		// unclassified, a truncated frame read as a server fault.
+		wire.IsOperateArgsMessage(err.Error()),
+		errIs(err, wire.ErrVectorArgsTruncated),
+		wire.IsVectorArgsTruncatedMessage(err.Error()):
+		// wire.ErrOperateArgs: a malformed operate frame — a vector_operate or a KV
+		// operate whose args do not decode, or which names a second target or a
+		// TTL the op does not carry (DecodeVectorOperateArgs /
+		// ops.checkVectorOperateArgs / DecodeOperateArgs). The caller built the
+		// frame, so it is their mistake to fix; unclassified it read as a server
+		// fault. The message names no key, no path and no size — only that the
+		// arguments are invalid — so it is safe verbatim.
+		//
+		// Sentinel only, no message-shape arm: this error is raised by the
+		// decoder the handler itself calls, so it reaches the classifier with its
+		// identity intact.
+		return status.Error(codes.InvalidArgument, err.Error())
 	case errIs(err, vector.ErrInvalidDim, vector.ErrInvalidMetric, vector.ErrInvalidM,
 		vector.ErrInvalidQuant, vector.ErrInvalidIVFPQ, vector.ErrInvalidIVFPQM,
 		vector.ErrInvalidQuantPQM, vector.ErrInvalidOPQ, vector.ErrInvalidOPQIters,
@@ -218,16 +250,42 @@ func grpcError(err error) error {
 		// server.clientFacingErr and httpapi.statusForError's 400 bucket for the
 		// same sentinel. Unclassified it fell to codes.Internal, which reads as a
 		// server fault and which standard gRPC retry policies hammer.
+		errIs(err, vector.ErrRecordMalformed),
+		// vector.ErrRecordMalformed: a payload carrying record bytes no operate
+		// engine can open. A caller mistake with a clear remedy (send a
+		// well-formed record) whose message names only the payload key the
+		// caller chose, so the same InvalidArgument bucket as the cap above.
+		errIs(err, vector.ErrPayloadKeyNotRecord),
+		// vector.ErrPayloadKeyNotRecord: a vector_operate aimed at a payload
+		// key that holds a plain value rather than a record. Same
+		// InvalidArgument bucket and reasoning — the caller chose the key, the
+		// remedy is to name a record key, and the message discloses only that
+		// key and the kind stored under it.
 		//
-		// Matched by sentinel AND by exact message shape: shard.decodePBResult
-		// rebuilds an op error with errors.New(string(payload)) across
-		// replication, so a clustered apply loses errors.Is identity — the same
-		// reason the other two classifiers carry a message-shape fallback. The
-		// fallback uses vector.IsRecordTooLargeMessage, NOT strings.Contains — a
-		// bare substring check would also match an unrelated internal error that
+		// All three matched by sentinel AND by exact message shape:
+		// shard.decodePBResult rebuilds op errors with
+		// errors.New(string(payload)) across replication, so a clustered apply
+		// loses errors.Is identity — the same reason server.clientFacingErr and
+		// httpapi.statusForError carry a message-shape fallback. Each fallback
+		// uses its own IsXMessage matcher, NOT strings.Contains — a bare
+		// substring check would also match an unrelated internal error that
 		// merely wraps the sentinel, leaking it to the caller unredacted.
-		vector.IsRecordTooLargeMessage(err.Error()):
+		vector.IsRecordTooLargeMessage(err.Error()),
+		vector.IsRecordMalformedMessage(err.Error()),
+		vector.IsPayloadKeyNotRecordMessage(err.Error()):
 		return status.Error(codes.InvalidArgument, err.Error())
+	case errIs(err, ops.ErrVectorRecordAbsent),
+		// ops.ErrVectorRecordAbsent: vector_operate with create=NONE against a
+		// payload key that holds no record — the caller declined to create one
+		// and there was none, so the thing they named does not exist ->
+		// NotFound, mirroring server.mapResult's StatusNotFound and
+		// httpapi.statusForError's 404 for the same signal (both keep KV and
+		// vector operate telling every transport's caller the same thing).
+		// The message-shape arm (ops.IsVectorRecordAbsentMessage, not
+		// strings.Contains — see the InvalidArgument bucket above for why)
+		// covers the same clustered-apply stringification.
+		ops.IsVectorRecordAbsentMessage(err.Error()):
+		return status.Error(codes.NotFound, err.Error())
 	case errIs(err, vector.ErrAPIKeyExists):
 		// Online key-admin: KeysAdd of an already-registered token. AlreadyExists
 		// (the etcd/gRPC create-conflict code) — the caller revokes first or picks a
@@ -273,6 +331,20 @@ func grpcError(err error) error {
 		// Internal (which retry policies hammer). String fallbacks cover the
 		// clustered/stringified path.
 		return status.Error(codes.ResourceExhausted, err.Error())
+	case errIs(err, ops.ErrOperateDuringReshard),
+		// ops.ErrOperateDuringReshard: a vector_operate against a collection a
+		// reshard is dual-writing. operate is not idempotent, so the store refuses
+		// rather than double-applying the op-list; the refusal lasts the minutes a
+		// reshard runs and the caller retries after cutover. Unavailable is the
+		// gRPC rendering of HTTP's 503 and the code standard retry policies and
+		// service meshes DO retry — unlike the Internal an unclassified sentinel
+		// fell to, which they hammer or hard-fail.
+		//
+		// Sentinel AND exact message shape, for the usual clustered-apply reason;
+		// ops.IsOperateDuringReshardMessage, not strings.Contains, so an internal
+		// fault that merely mentions the refusal is not leaked.
+		ops.IsOperateDuringReshardMessage(err.Error()):
+		return status.Error(codes.Unavailable, err.Error())
 	case strings.Contains(err.Error(), "not leader"),
 		strings.Contains(err.Error(), "no leader"),
 		strings.Contains(err.Error(), "no reachable owner"):

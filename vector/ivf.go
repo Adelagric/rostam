@@ -547,7 +547,9 @@ func (ix *ivf) RestoreInsertAt(id uint64, vec []float32, ttl time.Duration, meta
 }
 
 func (ix *ivf) restoreInsertBody(id uint64, vec []float32, ttl time.Duration, meta Metadata, sparse *SparseVector, keyExpires map[string]uint64, version uint64, stamped bool, nowMs uint64) error {
-	if err := checkRecordValues(meta); err != nil {
+	// REPLAY body: size only — the IVF twin of hnsw.restoreInsertBody. See
+	// checkRecordValuesSize.
+	if err := checkRecordValuesSize(meta); err != nil {
 		return err
 	}
 	if len(vec) != ix.cfg.Dim {
@@ -3658,6 +3660,169 @@ func (ix *ivf) overwritePayloadBody(id uint64, meta Metadata, keyTTLMs map[strin
 	return newMeta, ke, ix.arena.BumpVersion(slot), nil
 }
 
+// MutatePayloadRecord applies fn to the operate record stored under key in id's
+// payload and stores what fn returns, all inside ONE write-lock critical
+// section: read the current bytes, transform, bound, store/delete, prune the
+// key's deadline, reindex, bump. It is the store-agnostic seam ops.handleVector-
+// Operate drives with applyRecordBytes — vector never imports ops, so the
+// transform arrives as a function.
+//
+// Returns the RESULTING payload and per-key deadlines (so Collection WAL-logs
+// exactly what was applied), the resulting version, and changed. changed=false
+// means the call was a deliberate no-op (a failed CHECK, or a delete of an
+// absent key): nothing was stored, nothing was logged, the version is the
+// CURRENT one and was not bumped.
+//
+// THE KEY'S DEADLINE IS NOT CONSULTED HERE. Unstamped, `now` is this process's
+// own wall clock, and letting it decide whether the record EXISTS would let two
+// replicas store different bytes. So an unstamped mutation treats a
+// deadline-passed record as PRESENT and passes its deadline through untouched;
+// only the *At variant expires the key. See recordKeyPastDeadline
+// (vector/record_mutate.go).
+func (ix *ivf) MutatePayloadRecord(id uint64, key string, fn RecordMutator, cas CASCond) (Metadata, map[string]uint64, uint64, bool, error) {
+	return ix.mutatePayloadRecordBody(id, key, fn, cas, false, 0)
+}
+
+// MutatePayloadRecordAt judges the dead-point liveness gate, the per-key
+// deadline check and the stale-deadline drop against the EXPLICIT leader-stamped
+// clock nowMs, so a replicated record mutation sees the same record and produces
+// the same bytes on every replica (#4 vector TTL determinism, mirroring
+// SetPayloadAt).
+//
+// This is the ONLY variant that may expire the payload key: its clock is the
+// leader's stamp, identical on every replica. See recordKeyPastDeadline
+// (vector/record_mutate.go) for why the unstamped twin must not.
+func (ix *ivf) MutatePayloadRecordAt(id uint64, key string, fn RecordMutator, cas CASCond, nowMs int64) (Metadata, map[string]uint64, uint64, bool, error) {
+	return ix.mutatePayloadRecordBody(id, key, fn, cas, true, uint64(nowMs)) //nolint:gosec // stamped unix-millis is non-negative
+}
+
+// LOCKSTEP with vector/hnsw.go mutatePayloadRecordBody and the named/multi-vector
+// mutatePayloadRecordLockedAt in vector/named.go and vector/multivector.go.
+// These four bodies are ~110 near-identical lines each and are deliberately NOT
+// factored into one: that matches the house style of their set_payload /
+// overwrite_payload siblings, whose engine differences (slot- vs id-keyed
+// indexes, uint64 vs int64 deadlines, BM25 on dense only) are real and are what
+// a shared body would have to branch on.
+//
+// The cost is real too, and it has already been paid once: a single formatting
+// difference in the size-bound message landed as a defect in all four at the
+// same time, and the deadline rule below had to be corrected in all four at the
+// same time. So both of those now live in SHARED helpers — recordTooLargeErr
+// (vector/metadata.go) and recordKeyPastDeadline[Abs] (vector/record_mutate.go)
+// — and any further change to the RULES, as opposed to the plumbing, belongs in
+// a helper rather than in a fifth copy. A change here that is not mirrored in
+// the other three is a bug, not a variation.
+func (ix *ivf) mutatePayloadRecordBody(id uint64, key string, fn RecordMutator, cas CASCond, stamped bool, nowMs uint64) (Metadata, map[string]uint64, uint64, bool, error) {
+	if fn == nil || key == "" || key == contentField {
+		return nil, nil, 0, false, ErrPayloadKeyNotRecord
+	}
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	now := nowMs
+	if !stamped {
+		now = uint64(ix.now())
+	}
+	slot, ok := ix.arena.Slot(id)
+	if !ok || ix.tombstoned[slot] || ix.isExpiredAt(slot, now) {
+		return nil, nil, 0, false, ErrIDNotFound
+	}
+	if err := cas.check(ix.arena.Version(slot)); err != nil {
+		return nil, nil, 0, false, err // CAS mismatch: no mutation, no bump
+	}
+	oldMeta := ix.arena.Metadata(slot)
+	oldKE := ix.arena.KeyExpires(slot)
+	// Only a STAMPED apply may judge the key's deadline; an unstamped one treats
+	// the record as PRESENT and leaves the deadline alone. recordKeyPastDeadline
+	// (vector/record_mutate.go) carries the reasoning — the short version is that
+	// a per-replica wall clock deciding whether a record EXISTS makes replicas
+	// store different bytes, which is not the bounded-deadline-skew class
+	// setPayloadBody lives with. LOCKSTEP: the same two lines exist in
+	// vector/hnsw.go, vector/ivf.go, vector/named.go and vector/multivector.go.
+	keyPastDeadline := recordKeyPastDeadline(stamped, oldKE[key], now)
+	old, exists, err := currentRecordValue(oldMeta, key, keyPastDeadline)
+	if err != nil {
+		return nil, nil, 0, false, err
+	}
+	rec, act, err := fn(old, exists)
+	if err != nil {
+		return nil, nil, 0, false, err
+	}
+	switch act {
+	case RecordUnchanged:
+		return nil, nil, ix.arena.Version(slot), false, nil
+	case RecordDelete:
+		if !exists {
+			return nil, nil, ix.arena.Version(slot), false, nil
+		}
+	case RecordStore:
+		// The POST-mutation bound. checkRecordValues (vector/metadata.go) is the
+		// same cap on the ingest side, but it only ever sees a caller's patch —
+		// it cannot reach bytes the operate engine just produced, which is what
+		// this site exists for. Keep the two in step.
+		//
+		// SIZE FIRST, THEN SHAPE — the same order and the same two gates
+		// checkRecordValues applies to a caller's patch, so an oversize value is
+		// refused without ever being decoded.
+		//
+		// The shape check is here because MutatePayloadRecordCAS is EXPORTED. The
+		// mutator ops supplies returns applyRecordBytes' output, which phase 1
+		// held to the tree oracle and which cannot be malformed — but a direct Go
+		// caller of this API supplies its own mutator, and whatever bytes it
+		// returns were being stored on the size cap alone. That poisons the
+		// payload key for the whole collection: every path under it declines to
+		// accelerate, and a later vector_operate on the same key fails with
+		// wire.ErrOperateRecord. The cost is one decode of the bytes the engine
+		// just produced, on a write that already decoded and re-encoded the
+		// record.
+		//
+		// Both MESSAGES come from the one producer of their detailed form
+		// (recordTooLargeErr / recordMalformedErr, vector/metadata.go): one
+		// canonical shape for the transport matchers to anchor on across
+		// replication, with the caller's key bounded.
+		if len(rec) > maxRecordValueBytes {
+			return nil, nil, 0, false, recordTooLargeErr(key, len(rec))
+		}
+		if verr := validateRecord(rec); verr != nil {
+			return nil, nil, 0, false, recordMalformedErr(key, verr)
+		}
+	default:
+		return nil, nil, 0, false, ErrRecordMutation
+	}
+	merged := cloneMeta(oldMeta)
+	if act == RecordDelete {
+		delete(merged, key)
+		if len(merged) == 0 {
+			// An emptied payload stores nil, exactly as deletePayloadKeysBody
+			// normalizes it. Storing an empty non-nil map instead would make the
+			// live state differ from the same state after a WAL replay (the log
+			// encodes an empty payload as absent and restores nil), for no gain.
+			merged = nil
+		}
+	} else {
+		if merged == nil {
+			merged = make(Metadata, 1)
+		}
+		merged[key] = Value{Kind: ValueRecord, Rec: rec} // ownership hand-off; see RecordMutator
+	}
+	ke := cloneKeyExpires(oldKE)
+	// A key read as ABSENT above because its deadline had passed — STAMPED
+	// applies only: its stale deadline must go, or the record this call just
+	// created would be invisible the instant it is written. pruneKeyExpires only
+	// drops deadlines for keys no longer present. On an unstamped apply
+	// keyPastDeadline is false by construction, so an expired key's deadline is
+	// passed through UNTOUCHED, exactly as setPayloadBody passes an expired key
+	// through unchanged.
+	if ke != nil && keyPastDeadline {
+		delete(ke, key)
+	}
+	ke = pruneKeyExpires(ke, merged)
+	ix.arena.SetMetadata(slot, merged)
+	ix.arena.SetKeyExpires(slot, ke)
+	ix.payloadIdx.reindex(slot, merged)
+	ix.bumpData() // payload-value change: invalidate the order_by snapshot (NOT idSetVersion)
+	return merged, ke, ix.arena.BumpVersion(slot), true, nil
+}
+
 func (ix *ivf) DeletePayloadKeys(id uint64, keys []string, cas CASCond) (Metadata, map[string]uint64, uint64, error) {
 	return ix.deletePayloadKeysBody(id, keys, cas, false, 0)
 }
@@ -3733,7 +3898,9 @@ func (ix *ivf) clearPayloadBody(id uint64, cas CASCond, stamped bool, nowMs uint
 }
 
 func (ix *ivf) RestorePayload(id uint64, meta Metadata, keyExpires map[string]uint64, version uint64) error {
-	if err := checkRecordValues(meta); err != nil {
+	// REPLAY body: size only — the IVF twin of hnsw.RestorePayload. See
+	// checkRecordValuesSize.
+	if err := checkRecordValuesSize(meta); err != nil {
 		return err
 	}
 	ix.mu.Lock()

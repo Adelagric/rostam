@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -332,4 +333,233 @@ func TestStatusForErrorRecordTooLarge(t *testing.T) {
 			t.Errorf("%s: statusForError = %d, want 500", tc.name, got)
 		}
 	}
+}
+
+// errRealMalformedSingle, errRealMalformedBulk and errRealNotRecordDetailed reproduce
+// the EXACT shapes checkRecordValues / checkRecordValuesAll (ErrRecordMalformed)
+// and currentRecordValue (ErrPayloadKeyNotRecord) actually produce in
+// production — see vector.IsRecordMalformedMessage / IsPayloadKeyNotRecordMessage
+// for the format strings these mirror. httpapi cannot call those unexported
+// vector-package producers directly, so the shapes are reproduced by hand;
+// vector's own TestIsRecordMalformedMessage / TestIsPayloadKeyNotRecordMessage
+// pin them against the real producers.
+var (
+	errRealMalformedSingle   = fmt.Errorf("%w: payload key %q: %s", vector.ErrRecordMalformed, "session", "record: malformed record: wire: args too short")
+	errRealMalformedBulk     = fmt.Errorf("payload %d: %w", 7, errRealMalformedSingle)
+	errRealNotRecordDetailed = fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)
+)
+
+// TestStatusForErrorMalformedRecord pins the ingest gate's shape rejection as a
+// 400. vector.ErrRecordMalformed is what every wire-reachable entry returns for
+// record bytes no operate engine can open, and it arrived with the phase-2
+// ingest validation — a sentinel that matched nothing here would have surfaced a
+// caller's own bad bytes as an opaque 500 with the message redacted, so this
+// keeps it in the same bucket as ErrRecordTooLarge and in sync with
+// server.clientFacingErr.
+//
+// Per shape: the bare sentinel, the real %w-wrapped single/bulk shapes (matched
+// by errors.Is regardless of exact text), and those shapes stringified across
+// the Raft boundary (matched only by vector.IsRecordMalformedMessage, since
+// shard.decodePBResult rebuilds a replicated op error with errors.New and
+// errors.Is stops matching there). A negative control asserts an unrelated
+// error that merely wraps the sentinel with a foreign prefix stays a redacted
+// 500 — the exact bug a bare strings.Contains classifier would reintroduce.
+func TestStatusForErrorMalformedRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrRecordMalformed},
+		{"wrapped, real single-payload shape", errRealMalformedSingle},
+		{"wrapped, real bulk shape", errRealMalformedBulk},
+		{"stringified across Raft, real single-payload shape", errors.New(errRealMalformedSingle.Error())},
+		{"stringified across Raft, real bulk shape", errors.New(errRealMalformedBulk.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusBadRequest {
+				t.Errorf("statusForError(ErrRecordMalformed) = %d, want 400", got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix (%v, no %w identity)", func(t *testing.T) {
+		err := fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordMalformed)
+		if got := statusForError(err); got != http.StatusInternalServerError {
+			t.Errorf("statusForError(%v) = %d, want 500", err, got)
+		}
+	})
+}
+
+// TestStatusForErrorPayloadKeyNotRecord pins vector_operate's "that key does not
+// hold a record" refusal as a 400. The op deliberately refuses rather than
+// overwriting a plain value with a record, so the caller has a key to fix; an
+// unmatched sentinel here would have surfaced that as an opaque, redacted 500.
+// Kept in sync with server.clientFacingErr.
+//
+// Per shape: the bare sentinel, the real %w-wrapped detailed shape, and that
+// shape stringified across the Raft boundary. A negative control asserts an
+// unrelated error that merely wraps the sentinel with a foreign prefix stays a
+// redacted 500.
+func TestStatusForErrorPayloadKeyNotRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrPayloadKeyNotRecord},
+		{"wrapped, real detailed shape", errRealNotRecordDetailed},
+		{"stringified across Raft, real detailed shape", errors.New(errRealNotRecordDetailed.Error())},
+		{"stringified across Raft, bare shape", errors.New(vector.ErrPayloadKeyNotRecord.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusBadRequest {
+				t.Errorf("statusForError(ErrPayloadKeyNotRecord) = %d, want 400", got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix (%v, no %w identity)", func(t *testing.T) {
+		err := fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrPayloadKeyNotRecord)
+		if got := statusForError(err); got != http.StatusInternalServerError {
+			t.Errorf("statusForError(%v) = %d, want 500", err, got)
+		}
+	})
+}
+
+// TestStatusForErrorVectorRecordAbsent pins vector_operate's create=NONE refusal
+// as a 404, the HTTP rendering of the not-found status the binary transport
+// answers for the same signal (server.TestMapResultVectorRecordAbsentIsNotFound).
+// The caller declined to create a record and there was none: the thing they
+// named does not exist, which is what 404 means — not the redacted 500 an
+// unclassified sentinel would have produced.
+//
+// ErrVectorRecordAbsent has exactly ONE production shape — bare, never wrapped
+// (see ops.IsVectorRecordAbsentMessage's doc). "wrapped" here is a synthetic
+// %w wrap exercising errors.Is identity, not a real production shape;
+// "stringified" is the bare form re-created with errors.New, the real
+// clustered-apply shape. A negative control asserts an unrelated error that
+// wraps the sentinel with a foreign prefix (the OLD test's "stringified" case,
+// which a bare strings.Contains classifier used to accept) stays a redacted 500.
+func TestStatusForErrorVectorRecordAbsent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ops.ErrVectorRecordAbsent},
+		{"wrapped (synthetic %w, exercises errors.Is identity — production never wraps this sentinel)",
+			fmt.Errorf("shard 3: %w", ops.ErrVectorRecordAbsent)},
+		{"stringified across Raft, real bare shape", errors.New(ops.ErrVectorRecordAbsent.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusNotFound {
+				t.Errorf("statusForError = %d, want 404", got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + ops.ErrVectorRecordAbsent.Error())
+		if got := statusForError(err); got != http.StatusInternalServerError {
+			t.Errorf("statusForError(%v) = %d, want 500", err, got)
+		}
+	})
+}
+
+// TestStatusForErrorOperateDuringReshard pins the reshard refusal as a 503, the
+// HTTP rendering of the retryable answer the binary transport gives for the same
+// signal (server.TestMapResultOperateDuringReshardIsClientFacing). A
+// vector_operate against a collection a reshard is dual-writing is refused
+// because the op-list is not idempotent; the refusal lasts the minutes the
+// reshard runs and the caller retries after cutover. Unclassified it was a
+// redacted 500, so the retryability docs/vector/filtering.md promises never
+// reached the caller. No Retry-After: none of this transport's other retryable
+// buckets set one.
+//
+// A negative control asserts an unrelated fault that merely wraps the refusal
+// text with a foreign prefix stays a redacted 500.
+func TestStatusForErrorOperateDuringReshard(t *testing.T) {
+	detailed := ops.OperateDuringReshardErr("docs")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ops.ErrOperateDuringReshard},
+		{"production detailed form (names the collection)", detailed},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("shard 3: %w", ops.ErrOperateDuringReshard)},
+		{"stringified across Raft, bare shape", errors.New(ops.ErrOperateDuringReshard.Error())},
+		{"stringified across Raft, detailed shape", errors.New(detailed.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusServiceUnavailable {
+				t.Errorf("statusForError = %d, want 503", got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the refusal with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + detailed.Error())
+		if got := statusForError(err); got != http.StatusInternalServerError {
+			t.Errorf("statusForError(%v) = %d, want 500", err, got)
+		}
+	})
+}
+
+// TestStatusForErrorMalformedOperateFrame pins a malformed operate frame as a
+// 400, matching the binary transport's client-facing answer for the same
+// sentinel (server.TestMapResultMalformedOperateFrameIsClientFacing). The caller
+// built the frame; unclassified it was a redacted 500 that read as a server
+// fault. KV operate raises the same sentinel from the same decoder, so this arm
+// covers both ops.
+func TestStatusForErrorMalformedOperateFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrOperateArgs},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("vector_operate: %w", wire.ErrOperateArgs)},
+		// The clustered shape, and the one the sentinel arm cannot reach: an
+		// operate handler decodes inside the FSM apply, so shard.decodePBResult
+		// hands the error back rebuilt with errors.New and identity is gone.
+		{"stringified across Raft, real bare shape", errors.New(wire.ErrOperateArgs.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusBadRequest {
+				t.Errorf("statusForError = %d, want 400", got)
+			}
+		})
+	}
+	// Negative control: an unrelated internal fault that merely mentions the
+	// sentinel text must stay a redacted 500 — what exact equality buys over a
+	// strings.Contains arm.
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrOperateArgs.Error())
+		if got := statusForError(err); got != http.StatusInternalServerError {
+			t.Errorf("statusForError(%v) = %d, want 500", err, got)
+		}
+	})
+}
+
+// TestStatusForErrorTruncatedOperateFrame is the parity guard for
+// wire.ErrVectorArgsTruncated: the sentinel DecodeVectorOperateArgs raises for a
+// frame shorter than the fields it declares, beside the ErrOperateArgs it raises
+// for a complete-but-invalid one. Both are the caller's framing mistake, so both
+// answer 400 here, matching the binary transport
+// (server.TestMapResultTruncatedOperateFrameIsClientFacing) and gRPC's
+// InvalidArgument.
+func TestStatusForErrorTruncatedOperateFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrVectorArgsTruncated},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("vector_operate: %w", wire.ErrVectorArgsTruncated)},
+		{"stringified across Raft, real bare shape", errors.New(wire.ErrVectorArgsTruncated.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForError(tc.err); got != http.StatusBadRequest {
+				t.Errorf("statusForError = %d, want 400", got)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrVectorArgsTruncated.Error())
+		if got := statusForError(err); got != http.StatusInternalServerError {
+			t.Errorf("statusForError(%v) = %d, want 500", err, got)
+		}
+	})
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/shard"
 	"github.com/rostamlabs/rostam/vector"
 )
@@ -206,4 +207,334 @@ func TestMapResultKeepsRecordTooLargeVisible(t *testing.T) {
 			}
 		})
 	}
+}
+
+// errRealMalformedSingle, errRealMalformedBulk and errRealNotRecordDetailed reproduce
+// the EXACT shapes checkRecordValues / checkRecordValuesAll (ErrRecordMalformed)
+// and currentRecordValue (ErrPayloadKeyNotRecord) actually produce in
+// production — see vector.IsRecordMalformedMessage / IsPayloadKeyNotRecordMessage
+// for the format strings these mirror. server cannot call those unexported
+// vector-package producers directly, so the shapes are reproduced by hand;
+// vector's own TestIsRecordMalformedMessage / TestIsPayloadKeyNotRecordMessage
+// pin them against the real producers.
+var (
+	errRealMalformedSingle   = fmt.Errorf("%w: payload key %q: %s", vector.ErrRecordMalformed, "session", "record: malformed record: wire: args too short")
+	errRealMalformedBulk     = fmt.Errorf("payload %d: %w", 7, errRealMalformedSingle)
+	errRealNotRecordDetailed = fmt.Errorf("%w: payload key %q holds a value of kind %d", vector.ErrPayloadKeyNotRecord, "country", 2)
+)
+
+// TestClientFacingErrMalformedRecord pins the TCP transport's half of the same
+// classification the HTTP edge makes (httpapi.TestStatusForErrorMalformedRecord).
+// vector.ErrRecordMalformed is a caller mistake — bytes the caller sent that no
+// operate engine can open — so its message must reach the client verbatim rather
+// than being redacted to "internal error", which would leave a client unable to
+// tell a bad payload from a server fault.
+//
+// Per shape: the bare sentinel, the real %w-wrapped single/bulk shapes (matched
+// by errors.Is regardless of exact text), and those shapes stringified across
+// the Raft boundary (matched only by vector.IsRecordMalformedMessage — a
+// clustered apply loses errors.Is identity, which is why clientFacingErr also
+// carries a message-shape fallback). A negative control asserts an unrelated
+// error that merely wraps the sentinel with a foreign prefix stays redacted —
+// the exact bug a bare strings.Contains classifier would reintroduce.
+func TestClientFacingErrMalformedRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrRecordMalformed},
+		{"wrapped, real single-payload shape", errRealMalformedSingle},
+		{"wrapped, real bulk shape", errRealMalformedBulk},
+		{"stringified across Raft, real single-payload shape", errors.New(errRealMalformedSingle.Error())},
+		{"stringified across Raft, real bulk shape", errors.New(errRealMalformedBulk.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !clientFacingErr(tc.err) {
+				t.Error("clientFacingErr(ErrRecordMalformed) = false, want true")
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix (%v, no %w identity)", func(t *testing.T) {
+		if clientFacingErr(fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordMalformed)) {
+			t.Error("clientFacingErr(wrapped ErrRecordMalformed) = true, want false (redacted)")
+		}
+	})
+}
+
+// TestClientFacingErrRecordTooLarge is ErrRecordMalformed's sibling bound: a
+// record value above the storage cap is the same caller-fixable-mistake bucket.
+// Per shape: bare sentinel, real %w-wrapped shape, and that shape stringified
+// across the Raft boundary, plus a negative control for an unrelated wrap.
+func TestClientFacingErrRecordTooLarge(t *testing.T) {
+	wrapped := fmt.Errorf("%w: payload key %q holds a 17000000-byte record, the cap is 16777216 bytes", vector.ErrRecordTooLarge, "session")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrRecordTooLarge},
+		{"wrapped, real shape", wrapped},
+		{"stringified across Raft, real shape", errors.New(wrapped.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !clientFacingErr(tc.err) {
+				t.Error("clientFacingErr(ErrRecordTooLarge) = false, want true")
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix (%v, no %w identity)", func(t *testing.T) {
+		if clientFacingErr(fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrRecordTooLarge)) {
+			t.Error("clientFacingErr(wrapped ErrRecordTooLarge) = true, want false (redacted)")
+		}
+	})
+}
+
+// TestClientFacingErrPayloadKeyNotRecord pins the TCP transport's half of
+// httpapi.TestStatusForErrorPayloadKeyNotRecord. vector_operate refuses a
+// payload key that holds a plain value rather than a record — replacing it would
+// destroy data the caller can still read — and that refusal names the caller's
+// own key, so it must reach the client verbatim instead of being redacted to
+// "internal error", which would read as a server fault for a caller mistake.
+//
+// Per shape: bare sentinel, real %w-wrapped detailed shape, and that shape
+// stringified across the Raft boundary, plus a negative control for an
+// unrelated wrap.
+func TestClientFacingErrPayloadKeyNotRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", vector.ErrPayloadKeyNotRecord},
+		{"wrapped, real detailed shape", errRealNotRecordDetailed},
+		{"stringified across Raft, real detailed shape", errors.New(errRealNotRecordDetailed.Error())},
+		{"stringified across Raft, bare shape", errors.New(vector.ErrPayloadKeyNotRecord.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !clientFacingErr(tc.err) {
+				t.Error("clientFacingErr(ErrPayloadKeyNotRecord) = false, want true")
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix (%v, no %w identity)", func(t *testing.T) {
+		if clientFacingErr(fmt.Errorf("wal append failed at /var/lib/rostam/x: %v", vector.ErrPayloadKeyNotRecord)) {
+			t.Error("clientFacingErr(wrapped ErrPayloadKeyNotRecord) = true, want false (redacted)")
+		}
+	})
+}
+
+// TestMapResultVectorRecordAbsentIsNotFound pins vector_operate's create=NONE
+// refusal as the SAME wire status KV operate answers with. handleOperate maps
+// its create=NONE-against-an-absent-key case to cache.ErrNotFound, which
+// mapResult already answers StatusNotFound for (TestOperateCreateNoneOnAbsent
+// pins the KV half); ops.ErrVectorRecordAbsent is that signal for a record held
+// in a point's payload, so the two transports must not disagree about it. Left
+// unclassified it fell through to the redacted StatusError bucket, telling a
+// caller "internal error" for a record that simply is not there.
+//
+// ErrVectorRecordAbsent has exactly ONE production shape — bare, never wrapped
+// (see ops.IsVectorRecordAbsentMessage's doc). "wrapped" here is a synthetic
+// %w wrap exercising errors.Is identity, not a real production shape;
+// "stringified" is the bare form re-created with errors.New, the real
+// clustered-apply shape. A negative control asserts an unrelated error that
+// wraps the sentinel with a foreign prefix (the message-shape matcher's whole
+// reason to exist — a bare strings.Contains classifier used to accept this)
+// stays redacted.
+func TestMapResultVectorRecordAbsentIsNotFound(t *testing.T) {
+	disp := &fakeDispatcher{}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ops.ErrVectorRecordAbsent},
+		{"wrapped (synthetic %w, exercises errors.Is identity — production never wraps this sentinel)",
+			fmt.Errorf("shard 3: %w", ops.ErrVectorRecordAbsent)},
+		{"stringified across Raft, real bare shape", errors.New(ops.ErrVectorRecordAbsent.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, payload := mapResult(disp, nil, tc.err, "")
+			if status != StatusNotFound {
+				t.Fatalf("status = %d, want StatusNotFound (%d)", status, StatusNotFound)
+			}
+			if payload != nil {
+				t.Fatalf("payload = %q, want nil (the not-found status carries no body, as for cache.ErrNotFound)", payload)
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		status, payload := mapResult(disp, nil, errors.New("apply: "+ops.ErrVectorRecordAbsent.Error()), "")
+		if status != StatusError {
+			t.Fatalf("status = %d, want StatusError (%d), i.e. redacted, not StatusNotFound", status, StatusError)
+		}
+		if msg, _ := DecodeErrorPayload(payload); msg != "internal error" {
+			t.Fatalf("payload = %q, want the redacted message", msg)
+		}
+	})
+}
+
+// TestMapResultOperateDuringReshardIsClientFacing pins the reshard refusal as a
+// client-facing signal on the binary transport. A vector_operate against a
+// collection a reshard is dual-writing is REFUSED — the op-list is not
+// idempotent, so applying it to both generations would double-count — and the
+// whole design rests on the caller learning it should retry after cutover.
+// Unclassified, the refusal fell to the redacted internal-error bucket and a
+// retryable transient read as a server fault.
+//
+// StatusError with the verbatim message is the same answer this transport gives
+// the other retryable conditions ("no reachable owner" and friends); StatusNotLeader
+// is specifically a leader hint and this is not a leadership condition.
+//
+// A negative control asserts an unrelated fault that merely wraps the refusal
+// text with a foreign prefix stays redacted — the exact class a bare
+// strings.Contains arm would leak.
+func TestMapResultOperateDuringReshardIsClientFacing(t *testing.T) {
+	disp := &fakeDispatcher{}
+	detailed := ops.OperateDuringReshardErr("docs")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ops.ErrOperateDuringReshard},
+		{"production detailed form (names the collection)", detailed},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("shard 3: %w", ops.ErrOperateDuringReshard)},
+		{"stringified across Raft, bare shape", errors.New(ops.ErrOperateDuringReshard.Error())},
+		{"stringified across Raft, detailed shape", errors.New(detailed.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, payload := mapResult(disp, nil, tc.err, "")
+			if status != StatusError {
+				t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+			}
+			msg, _ := DecodeErrorPayload(payload)
+			if msg == "internal error" {
+				t.Fatalf("the refusal was redacted to %q — the caller is never told to retry", msg)
+			}
+			if msg != tc.err.Error() {
+				t.Fatalf("payload = %q, want the verbatim refusal %q", msg, tc.err.Error())
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the refusal with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + detailed.Error())
+		status, payload := mapResult(disp, nil, err, "")
+		if status != StatusError {
+			t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+		}
+		if msg, _ := DecodeErrorPayload(payload); msg != "internal error" {
+			t.Fatalf("payload = %q, want the redacted message", msg)
+		}
+	})
+}
+
+// TestMapResultMalformedOperateFrameIsClientFacing pins a malformed operate
+// frame as the caller's mistake on the binary transport. wire.ErrOperateArgs is
+// what DecodeVectorOperateArgs, ops.checkVectorOperateArgs and the KV
+// DecodeOperateArgs raise for args that do not decode, that name a second target,
+// or that carry a TTL the op does not own. Unclassified, a client protocol
+// mistake read as a server fault and the message was redacted, leaving the caller
+// nothing to act on.
+//
+// KV operate raises the same sentinel from the same decoder, so this one arm
+// covers both ops.
+func TestMapResultMalformedOperateFrameIsClientFacing(t *testing.T) {
+	disp := &fakeDispatcher{}
+	// A real production shape, not a hand-written sentinel: a structurally
+	// complete frame declaring an EMPTY payload key, which
+	// DecodeVectorOperateArgs rejects with ErrOperateArgs.
+	frame := append([]byte{4, 'd', 'o', 'c', 's'}, make([]byte, 8)...) // colLen, "docs", id=0
+	frame = append(frame, 0, 0)                                        // pkLen = 0
+	_, _, _, _, _, _, decErr := wire.DecodeVectorOperateArgs(frame)
+	if !errors.Is(decErr, wire.ErrOperateArgs) {
+		t.Fatalf("decoder fixture drifted: err = %v, want wire.ErrOperateArgs", decErr)
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrOperateArgs},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("vector_operate: %w", wire.ErrOperateArgs)},
+		{"as the decoder actually returns it", decErr},
+		// The clustered shape, and the one the sentinel arm cannot reach: an
+		// operate handler decodes inside the FSM apply, so shard.decodePBResult
+		// hands the error back rebuilt with errors.New and identity is gone.
+		{"stringified across Raft, real bare shape", errors.New(wire.ErrOperateArgs.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, payload := mapResult(disp, nil, tc.err, "")
+			if status != StatusError {
+				t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+			}
+			msg, _ := DecodeErrorPayload(payload)
+			if msg == "internal error" {
+				t.Fatalf("a malformed frame was redacted to %q — a client protocol mistake reads as a server fault", msg)
+			}
+			if msg != tc.err.Error() {
+				t.Fatalf("payload = %q, want the verbatim message %q", msg, tc.err.Error())
+			}
+		})
+	}
+	// Negative control: an unrelated internal fault that merely mentions the
+	// sentinel text must STAY redacted. This is what an exact-equality matcher
+	// buys over a strings.Contains arm.
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrOperateArgs.Error())
+		status, payload := mapResult(disp, nil, err, "")
+		if status != StatusError {
+			t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+		}
+		if msg, _ := DecodeErrorPayload(payload); msg != "internal error" {
+			t.Fatalf("payload = %q, want the redacted message", msg)
+		}
+	})
+}
+
+// TestMapResultTruncatedOperateFrameIsClientFacing is the parity guard for
+// wire.ErrVectorArgsTruncated, the sentinel DecodeVectorOperateArgs raises for a
+// frame SHORTER than the fields it declares — right beside the ErrOperateArgs it
+// raises for a complete-but-invalid one.
+//
+// Both are the caller's framing mistake and both say nothing but "the arguments
+// do not decode", so both belong in the same bucket. Left unclassified, a
+// truncated frame was redacted to "internal error" and the caller was told a
+// server fault had happened.
+func TestMapResultTruncatedOperateFrameIsClientFacing(t *testing.T) {
+	disp := &fakeDispatcher{}
+	// A real production shape: a frame that declares a 4-byte collection name
+	// and then simply stops.
+	frame := []byte{4, 'd', 'o'}
+	_, _, _, _, _, _, decErr := wire.DecodeVectorOperateArgs(frame)
+	if !errors.Is(decErr, wire.ErrVectorArgsTruncated) {
+		t.Fatalf("decoder fixture drifted: err = %v, want wire.ErrVectorArgsTruncated", decErr)
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", wire.ErrVectorArgsTruncated},
+		{"wrapped (%w, exercises errors.Is identity)", fmt.Errorf("vector_operate: %w", wire.ErrVectorArgsTruncated)},
+		{"as the decoder actually returns it", decErr},
+		{"stringified across Raft, real bare shape", errors.New(wire.ErrVectorArgsTruncated.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, payload := mapResult(disp, nil, tc.err, "")
+			if status != StatusError {
+				t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+			}
+			msg, _ := DecodeErrorPayload(payload)
+			if msg == "internal error" {
+				t.Fatalf("a truncated frame was redacted to %q — a client protocol mistake reads as a server fault", msg)
+			}
+			if msg != tc.err.Error() {
+				t.Fatalf("payload = %q, want the verbatim message %q", msg, tc.err.Error())
+			}
+		})
+	}
+	t.Run("negative/unrelated fault wrapping the sentinel with a foreign prefix", func(t *testing.T) {
+		err := errors.New("apply: " + wire.ErrVectorArgsTruncated.Error())
+		status, payload := mapResult(disp, nil, err, "")
+		if status != StatusError {
+			t.Fatalf("status = %d, want StatusError (%d)", status, StatusError)
+		}
+		if msg, _ := DecodeErrorPayload(payload); msg != "internal error" {
+			t.Fatalf("payload = %q, want the redacted message", msg)
+		}
+	})
 }

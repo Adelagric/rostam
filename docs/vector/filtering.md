@@ -125,6 +125,14 @@ list-valued payload shares its slice. Read it, never write through it — mutati
 it changes the live record while the index still describes the old bytes. Copy
 the slice if you need to keep or edit it.
 
+Every write that stores a record value is **validated at ingest** — insert,
+insert-if-absent, upsert, `set_payload`, `overwrite_payload` and the bulk
+paths alike. Bytes no operate engine could open are refused before
+anything changes — HTTP 400, gRPC `InvalidArgument`, or the binary protocol's
+remote error, carrying `vector: record payload value is not a decodable operate
+record` — and so is a record above the 16 MiB storage cap. A mis-encoded `rec`
+is therefore a rejected request, not a stored value that misbehaves later.
+
 ### Path grammar
 
 A filter's `field` string is tried as an exact payload key first. Only when
@@ -261,9 +269,14 @@ the index for **every point**, for as long as the malformed record survives:
 filtered search and delete/scroll selection fall back to evaluating the live
 record, which stays correct. The key regains acceleration automatically once
 the malformed point's payload is repaired, cleared, or the point itself is
-reclaimed; it is a tracked state, not a one-way trip. Since a hand-crafted
-byte string can trigger this, produce records only through `operate` or its
-SDK encoder, never by hand.
+reclaimed; it is a tracked state, not a one-way trip.
+
+Ingest validation (above) means a write can no longer put the collection into
+this state: every entry that stores a record value refuses one that cannot be
+decoded. The fail-closed machinery remains as the backstop for records written
+before that gate existed and for anything restored from an older snapshot or
+log, which replay must never refuse. Produce records only through `operate` or
+its SDK encoder, never by hand.
 
 ### Known limits
 
@@ -287,6 +300,153 @@ SDK encoder, never by hand.
   of the payload index for the operators it cannot narrow.
 - A positional field (`#N`) is always evaluated live, regardless of
   selectivity, per the indexing rule above.
+
+## Updating a record in place
+
+`vector_operate` runs the same
+[`operate` op-list](../kv/overview.md#atomic-multi-field-updates-operate) the
+KV store uses, but against the record held in one point's payload instead of
+a KV key: one atomic op-list, applied to one point's record, under the
+collection's write lock, in one apply. The op list, the paths into a record,
+the scalar types and the returns are **exactly** `operate`'s — this page does
+not repeat that grammar; see the KV page for the ops, types, `CHECK`/`SET`/
+`ADD`/table semantics, and the returned `OperateResult`.
+
+A call is named by four things: the **collection**, the point's **ID**, the
+**payload key** the record lives under, and the **op-list** (`*wire.OperateArgs`)
+to run. The Go typed client's [`Collection.Operate`](../api/go-client.md)
+also accepts an optional CAS precondition on the point's version, same as
+`SetPayload`.
+
+Two fields `operate` normally carries do not apply here and are **rejected**,
+not ignored:
+
+- The op-list's inner **key** must be empty. The target is already named once,
+  by `(collection, id, payloadKey)`; a caller who set it too would be a second,
+  silently-ignored source of truth for what the call touches.
+- **`ttlMode`/`ttl`** must stay at their zero values (`OperateTTLKeep`, `0`). A
+  point's TTL belongs to the point, set by `Upsert`/`Insert`/`Expire` — not to
+  a record living inside one of its payload values — so a caller who set a TTL
+  here expecting it to take effect would otherwise get silence.
+
+`create` still applies as it does for `operate`: `vector_operate` may create
+the record if the payload key is absent. `create = NONE` against a payload key
+that holds no record is an **error**, not a silent no-op — the caller declined
+to create one and there was none. A payload key that holds something other
+than a record (a plain string, number, or the reserved document-content key)
+is also an error: silently replacing a value the caller can still read through
+`get`/search would destroy data on a call the caller believes only touches a
+record.
+
+A stored record `vector_operate` cannot open fails the call and leaves the
+point exactly as it was — no partial mutation, no version bump. **From this
+release, every write that stores a record value is validated at ingest** (see
+[Record paths](#record-paths) above), so a malformed stored record can now
+only be one written by an earlier version, before that gate existed. The
+mutation path itself does not re-validate the bytes it produces on a
+successful op-list: they come from the same `operate` engine that already
+holds them well-formed by construction, and re-decoding them on every call
+would double the cost of a plain counter increment for a case that cannot
+arise from a well-formed input. A failed `CHECK` — the op-list's own
+conditional — leaves the record untouched: it bumps no version and writes no
+WAL record, exactly like a `CHECK`-failed `operate` against a KV key.
+
+A record's top-level fields are indexed the same way [Record paths](#record-paths)
+describes for any record-valued payload: a mutation reindexes the point in the
+same write-lock critical section that applies it, so a filtered search sees
+the new field values immediately — there is no separate reindex step to wait
+on. The record is still bound by the same 16 MiB storage cap every other
+record-writing entry point enforces.
+
+### Clocks and per-key deadlines
+
+The only clock the **op-list** consults is the applying transaction's stamp,
+exactly as for a KV
+[`operate`](../kv/overview.md#atomic-multi-field-updates-operate): `STAMP` and
+everything that reads it never see a wall clock. On an unreplicated or otherwise
+unstamped apply that stamp is `0`, so an unstamped `STAMP` writes `0` — the same
+caveat the KV page records, and with the same consequence for a
+`MIN_COL`/`MAX_COL` "LRU" column built on it.
+
+One gate outside the op-list is **not** covered by that rule, and it is worth
+knowing about: whether the POINT itself is still alive. On an unstamped apply
+that liveness check is judged against the node's wall clock, exactly as
+`set_payload`'s is, so near a point's own TTL expiry two replicas can disagree
+about whether the call applies at all. This is a pre-existing property of every
+unstamped write rather than something specific to `operate` — making record
+mutation disagree with its siblings about whether a point exists would be worse —
+and it goes away when leader apply stamps are enabled. The per-key deadline
+below, which decides the record's own content, IS covered.
+
+The payload key's own **per-key deadline** (set by `set_payload`'s `keyTTLMs`)
+is judged on the same terms. On a **stamped** apply a key whose deadline has
+passed reads as absent: the op-list starts a fresh record and the stale
+deadline is dropped. On an **unstamped** apply the deadline is not consulted at
+all — the record is mutated in place and its deadline is passed through
+unchanged.
+
+That asymmetry is deliberate. Every replica runs the op-list itself, so if an
+unstamped apply judged the deadline against its own wall clock, a replica past
+the deadline would create a fresh record while a replica short of it
+incremented the stored one, and the two would hold different bytes forever. A
+wall-clock read is only safe where it can move a deadline *value* (as
+`set_payload` does, at a bounded millisecond skew), not where it decides
+whether a record exists. The key remains invisible to reads until its deadline
+is refreshed either way.
+
+`vector_operate` is **refused while the collection is resharding** (a
+partitioned collection whose shard count is changing dual-writes every op to
+both the old and new shard generation; `set_payload`-style dual-writing is
+safe because storing the same payload twice is idempotent, but an op-list's
+`ADD`/`MUL`/`SHL` are not — the two copies could disagree by an arbitrary
+number of increments and the disagreement would survive cutover). The refusal
+is retryable after the reshard completes. It is a check against the local
+catalog, not a fence: a reshard that begins in the single dispatch between
+that check and the call's apply is not caught, so the refusal covers a
+reshard already in progress and races the instant one begins by one dispatch.
+
+```go
+schema := &wire.Schema{Version: 1, StoreNames: true, Fields: []wire.FieldDef{
+    {Name: "rc", Type: wire.OperateTypeU8},
+    {Name: "bc", Type: wire.OperateTypeU8},
+    {Name: "hist", Type: wire.OperateTypeU32},
+    {Name: "bal", Type: wire.OperateTypeI32},
+    {Name: "tag", Type: wire.OperateTypeBytes},
+    {Name: "b", Type: wire.OperateTypeTable, Table: &wire.TableDef{
+        KeyType: wire.OperateTypeU64,
+        Cols: []wire.ColumnDef{
+            {Name: "hi", Type: wire.OperateTypeU32},
+            {Name: "lo", Type: wire.OperateTypeU32},
+        },
+    }},
+}}
+
+args, err := client.NewOperate(nil).WithSchema(schema).
+    Add(client.F("rc"), 1).
+    Return(client.F("rc")).
+    Count(client.F("b")).
+    Args()
+if err != nil {
+    return err
+}
+found, res, version, err := posts.Operate(ctx, client.OperateRequest{
+    ID: 1, PayloadKey: "session", Args: args,
+})
+if err != nil {
+    return err
+}
+if !found {
+    return nil // the point is absent, tombstoned or expired; res is nil
+}
+// res.Values[0]: the new "rc", res.Values[1]: the "b" table's row count
+// version: the point's version AFTER the call — feed it to the next call's
+// ExpectedVersion to run a CAS loop without re-reading the point. A call that
+// failed with ErrVersionConflict returns 0, not the conflicting version.
+```
+
+This mirrors `TestVectorOperateAgainstSchemaRecord` (`ops/vector_operate_test.go`):
+an `ADD` on a schema-mode `rc` field survives beside an untouched `b` table,
+and both are read back in the same round trip.
 
 ## Building filters from Python
 

@@ -18,6 +18,7 @@ import (
 	"github.com/rostamlabs/rostam/authz"
 	"github.com/rostamlabs/rostam/dashboard"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -500,12 +501,28 @@ func statusForError(err error) int {
 		// Matched by sentinel AND by exact message shape: a clustered apply
 		// rebuilds the op error with errors.New across the replication boundary
 		// (shard.decodePBResult), so errors.Is alone loses it there and the error
-		// would fall through to the redacted 500 bucket. The message-shape arm
-		// uses vector.IsRecordTooLargeMessage, NOT strings.Contains — a bare
+		// would fall through to the redacted 500 bucket. The message-shape arms
+		// use vector.IsRecordTooLargeMessage, NOT strings.Contains — a bare
 		// substring check would also match an unrelated internal error that
 		// merely wraps the sentinel, leaking it to the caller unredacted.
 		errors.Is(err, vector.ErrRecordTooLarge),
 		vector.IsRecordTooLargeMessage(err.Error()),
+		// Record bytes no operate engine can open: 400, not 500. Storing them
+		// would poison every accelerated filter under that payload key for the
+		// whole collection, so refusing at the door is the client-fixable
+		// mistake. Keeps this classifier in sync with server.clientFacingErr.
+		// Same sentinel-plus-message-shape matching, for the same
+		// clustered-apply reason.
+		errors.Is(err, vector.ErrRecordMalformed),
+		vector.IsRecordMalformedMessage(err.Error()),
+		// A vector_operate against a payload key holding a non-record value: 400,
+		// not 500. Silently replacing that value would destroy data the caller can
+		// still read, so the op refuses — a client-fixable mistake. Keeps this
+		// classifier in sync with server.clientFacingErr.
+		// Same sentinel-plus-message-shape matching, for the same
+		// clustered-apply reason.
+		errors.Is(err, vector.ErrPayloadKeyNotRecord),
+		vector.IsPayloadKeyNotRecordMessage(err.Error()),
 		errors.Is(err, vector.ErrEmptyFilter),
 		errors.Is(err, vector.ErrEmptyGroupBy),
 		errors.Is(err, vector.ErrSparseMismatch),
@@ -556,8 +573,53 @@ func statusForError(err error) int {
 		// mistakes with obvious remedies → 400, message unredacted (it names only
 		// sizes and the op the caller sent). Kept in sync with
 		// server.clientFacingErr by the shared const.
-		strings.Contains(err.Error(), ops.WASMRegistrationRefusedMsg):
+		strings.Contains(err.Error(), ops.WASMRegistrationRefusedMsg),
+		// wire.ErrOperateArgs: a malformed operate frame — a vector_operate or a KV
+		// operate whose args do not decode, or which names a second target or a
+		// TTL the op does not carry (DecodeVectorOperateArgs /
+		// ops.checkVectorOperateArgs / DecodeOperateArgs). The caller built the
+		// frame, so it is their mistake to fix; unclassified it read as a server
+		// fault. The message names no key, no path and no size — only that the
+		// arguments are invalid — so it is safe verbatim.
+		//
+		// Sentinel AND exact message shape, both arms load-bearing. The sentinel
+		// arm covers the direct path, where the decoder the handler itself calls
+		// hands the error back with its identity intact.
+		// The message-shape arm covers the clustered path, which stringifies the
+		// sentinel across the Raft boundary:
+		// an operate handler decodes its frame INSIDE the FSM apply, so
+		// shard.decodePBResult rebuilds the error with errors.New and errors.Is
+		// stops matching — which left a malformed frame from a clustered caller
+		// redacted as a server fault, the one case the sentinel arm above cannot
+		// reach. wire.IsOperateArgsMessage, not strings.Contains: a bare
+		// substring check would also match an unrelated internal error that
+		// merely wraps the sentinel, leaking it unredacted.
+		//
+		// wire.ErrVectorArgsTruncated rides in the same bucket, by both arms, for
+		// the same reasons: DecodeVectorOperateArgs raises it for a frame shorter
+		// than the fields it declares, right beside the ErrOperateArgs it raises
+		// for a complete-but-invalid one. Both are the caller's framing mistake
+		// and both name nothing but "the arguments do not decode"; left
+		// unclassified, a truncated frame read as a server fault.
+		wire.IsOperateArgsMessage(err.Error()),
+		errors.Is(err, wire.ErrOperateArgs),
+		wire.IsVectorArgsTruncatedMessage(err.Error()),
+		errors.Is(err, wire.ErrVectorArgsTruncated):
 		return http.StatusBadRequest
+	case errors.Is(err, ops.ErrVectorRecordAbsent),
+		// The clustered path stringifies the sentinel across the Raft boundary, so
+		// errors.Is stops matching there. ops.IsVectorRecordAbsentMessage, not
+		// strings.Contains: a bare substring check would also match an unrelated
+		// internal error that merely wraps the sentinel, leaking it unredacted.
+		ops.IsVectorRecordAbsentMessage(err.Error()):
+		// vector_operate with create = NONE against a payload key that holds no
+		// record: the caller declined to create one and there was none, so the
+		// thing they named does not exist → 404. This is the HTTP rendering of the
+		// StatusNotFound the binary transport answers for the same signal (see
+		// server.mapResult), which in turn matches what KV operate answers for
+		// create = NONE against an absent key. Unclassified it was a redacted 500,
+		// which reads as a server fault for an ordinary miss.
+		return http.StatusNotFound
 	case errors.Is(err, vector.ErrAPIKeyExists):
 		// Online key-admin: POST /v1/admin/keys with an already-registered token.
 		// 409 Conflict (the standard create-conflict code).
@@ -654,6 +716,22 @@ func statusForError(err error) int {
 		// policies hammer, and which pages operators on client-side throttling). String
 		// fallbacks cover the clustered/stringified path.
 		return http.StatusTooManyRequests
+	case errors.Is(err, ops.ErrOperateDuringReshard),
+		// ops.ErrOperateDuringReshard: a vector_operate against a collection a
+		// reshard is dual-writing. operate is not idempotent, so the store refuses
+		// rather than double-applying the op-list, and the refusal is transient —
+		// it lasts the minutes a reshard runs and the caller retries after
+		// cutover. 503, the same bucket as the leadership/ownership transients
+		// below and the same one the other retryable conditions on this transport
+		// use (no Retry-After: none of them set one). Unclassified it was a
+		// redacted 500, so the retryability docs/vector/filtering.md promises
+		// never reached the caller.
+		//
+		// Sentinel AND exact message shape, for the usual clustered-apply reason;
+		// ops.IsOperateDuringReshardMessage, not strings.Contains, so an internal
+		// fault that merely mentions the refusal is not leaked.
+		ops.IsOperateDuringReshardMessage(err.Error()):
+		return http.StatusServiceUnavailable
 	case strings.Contains(err.Error(), "not leader"),
 		strings.Contains(err.Error(), "no leader"),
 		strings.Contains(err.Error(), "no reachable owner"):
