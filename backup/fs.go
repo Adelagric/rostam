@@ -36,55 +36,22 @@ type FSObjectStore struct {
 var _ objstore.ObjectStore = (*FSObjectStore)(nil)
 
 // putTempPrefix is the fixed name prefix of every Put staging file. It is kept
-// out of the ".snap"/".cfg.json" key space (List/LatestKey/prune filter on
-// ".snap") so an in-flight staging file is never mistaken for a published
-// object, and it lets cleanupStaging identify leftover temps to sweep at open.
+// OUT of the ".snap"/".cfg.json" key space (List/LatestKey/prune filter on
+// ".snap") so an in-flight staging file is never seen by retention as a
+// published object. A staging file left behind by a process killed mid-Put is
+// not auto-reclaimed here — a startup sweep would race a concurrent writer on a
+// shared root and cannot tell a final key from a temp by prefix alone, so
+// reclaiming leftovers is left to a later Put to the same key or to maintenance.
+// It is a small, inert file, never selectable as a snapshot.
 const putTempPrefix = ".rostam-put-"
 
 // NewFSObjectStore returns an FSObjectStore rooted at root, creating root if it
-// does not exist. It also sweeps any leftover Put staging files (putTempPrefix…)
-// under root: a process killed mid-Put leaves one behind, and since retention
-// only ever lists ".snap" objects nothing else would ever reclaim it, so
-// interrupted writes would accumulate until the volume filled. The sweep is safe
-// at construction because no Put can be in flight on a store that does not exist
-// yet.
+// does not exist.
 func NewFSObjectStore(root string) (*FSObjectStore, error) {
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, fmt.Errorf("fsstore: mkdir root %q: %w", root, err)
 	}
-	f := &FSObjectStore{root: root}
-	if err := f.cleanupStaging(); err != nil {
-		return nil, fmt.Errorf("fsstore: sweep staging files under %q: %w", root, err)
-	}
-	return f, nil
-}
-
-// cleanupStaging removes leftover Put staging files (putTempPrefix…) anywhere
-// under root. Called once at construction — never concurrently with a Put — so a
-// matched file is always an abandoned temp from a previous process, never a live
-// write in progress.
-func (f *FSObjectStore) cleanupStaging() error {
-	// Collect during the walk and delete AFTER it, never inside the callback: a
-	// filesystem mutation in a WalkDir callback races the walk's own path
-	// resolution (gosec G122), so gather the paths first, then remove them.
-	var stale []string
-	if err := filepath.WalkDir(f.root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() && strings.HasPrefix(d.Name(), putTempPrefix) {
-			stale = append(stale, p)
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	for _, p := range stale {
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return nil
+	return &FSObjectStore{root: root}, nil
 }
 
 // keyToPath resolves a forward-slash object key to an on-disk path under root,
