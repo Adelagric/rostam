@@ -88,7 +88,12 @@ func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int
 	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
 		return fmt.Errorf("fsstore: mkdir for %q: %w", key, err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".tmp-*"+snapExt)
+	// Staging name deliberately does NOT end in snapExt: List/LatestKey/prune
+	// filter on the ".snap" suffix, so a temp named "*.snap" would be visible to
+	// them mid-write — a concurrent prune could delete an in-flight Put's staging
+	// file (or the temp could inflate a retention count). A ".tmp" suffix keeps it
+	// invisible to those filters until the atomic rename publishes the real key.
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".rostam-put-*.tmp")
 	if err != nil {
 		return fmt.Errorf("fsstore: temp for %q: %w", key, err)
 	}
