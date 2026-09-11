@@ -158,6 +158,20 @@ func (tx *TxContext) GetWithExpiry(key []byte) (val []byte, expiryMs uint64, err
 	return tx.c.GetWithExpiry(key)
 }
 
+// GetWithExpiryInto is GetWithExpiry appending into dst, so a handler that
+// reuses one buffer pays no allocation per hit. It honours the apply stamp
+// exactly as GetWithExpiry does.
+//
+// Unlike GetWithExpiry the result does NOT alias the page backing store: the
+// value is copied into dst, so it is a caller-owned slice that may be mutated
+// and retained.
+func (tx *TxContext) GetWithExpiryInto(dst, key []byte) (val []byte, expiryMs uint64, err error) {
+	if tx.applyStamped {
+		return tx.c.GetWithExpiryIntoAt(dst, key, tx.applyNowMs)
+	}
+	return tx.c.GetWithExpiryInto(dst, key)
+}
+
 // PutAbs inserts or replaces the entry for key with a pre-computed ABSOLUTE
 // expiry (ms since epoch; 0 = no expiry), bypassing any TTL→now+ttl conversion.
 // It is the primitive for REPLACING a value while preserving an existing

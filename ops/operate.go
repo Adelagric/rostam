@@ -33,11 +33,13 @@ import (
 // prior record, with the same stamp, therefore always produce identical
 // stored bytes and identical expiries.
 //
-// cur aliasing: tx.GetWithExpiry's returned value aliases the cache's page.
-// applyRecordBytes copies it before making any change (openRecord ->
-// copyRecord) and returns its own, freshly allocated out; this handler never
-// writes through cur and never touches it again once applyRecordBytes has
-// been called.
+// cur ownership: tx.GetWithExpiryInto copies the stored record into a pooled
+// buffer, so cur is owned by this call rather than aliasing the cache's page.
+// It still must not outlive the handler - the buffer goes back to the pool on
+// return - and nothing here needs it to: applyRecordBytes copies it again
+// before making any change (openRecord -> copyRecord) and returns its own,
+// freshly allocated out, and this handler never writes through cur nor touches
+// it once applyRecordBytes has been called.
 // operateArgsPool recycles the decoded call. The op slice is the single
 // largest allocation on this path - one operate request carries up to
 // OperateMaxOps ops, and a caller that touches many keys in one call sends a
@@ -48,6 +50,24 @@ import (
 // them during the call, so the struct is safe to return to the pool as soon
 // as handleOperate returns.
 var operateArgsPool = sync.Pool{New: func() any { return new(wire.OperateArgs) }}
+
+// operateReadBufPool backs the pooled record read in handleOperate. Buffers
+// grown past maxPooledReadBuf are dropped rather than pooled, to bound retained
+// memory: a record may reach maxOperateRecordBytes, and a value written by a
+// plain put can be larger still - GetWithExpiryInto grows the buffer to hold it
+// before copyRecord rejects it - so pooling unconditionally would let a few
+// outsized keys pin a large array per pool slot. Same guard as the client's
+// kvArgsPool.
+const maxPooledReadBuf = 64 << 10
+
+var operateReadBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
+
+func putOperateReadBuf(bp *[]byte) {
+	if cap(*bp) <= maxPooledReadBuf {
+		*bp = (*bp)[:0]
+		operateReadBufPool.Put(bp)
+	}
+}
 
 func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 	a, _ := operateArgsPool.Get().(*wire.OperateArgs)
@@ -72,7 +92,15 @@ func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	cur, expiryMs, err := tx.GetWithExpiry(a.Key)
+	// Pooled read buffer: the stored record is only read here and by
+	// applyRecordBytes, which copies whatever it needs, so the bytes never
+	// outlive the call. GetWithExpiryInto copies into this buffer instead of
+	// allocating a fresh one per request - the read was the largest remaining
+	// allocation on this path after the args pool.
+	rb, _ := operateReadBufPool.Get().(*[]byte)
+	defer func() { putOperateReadBuf(rb) }()
+	cur, expiryMs, err := tx.GetWithExpiryInto((*rb)[:0], a.Key)
+	*rb = cur
 	absent := errors.Is(err, cache.ErrNotFound)
 	if err != nil && !absent {
 		return nil, err
