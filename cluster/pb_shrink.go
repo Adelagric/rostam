@@ -25,11 +25,13 @@ import (
 // the stalled pipeline resumes — provably without losing any acked write (the
 // no-acked-loss / no-false-commit proofs live on Engine.ShrinkISR).
 //
-// THE minISR FLOOR IS ENFORCED HERE. OpSetShardISR's FSM apply is epoch-guarded
-// but does NOT check minISR (meta_fsm.go), so a shrink that would drop the ISR
-// below the durability floor must be refused by THIS driver — the shard then
-// stays stalled (H3: choose unavailability over durability loss). decidePBShrink
-// is the pure, floor-enforcing decision; pbShrinkDriver.tick is its plumbing.
+// THE minISR FLOOR IS ENFORCED HERE, FIRST. This driver refuses to even request a
+// shrink that would drop the ISR below the durability floor — the shard then stays
+// stalled (H3: choose unavailability over durability loss). decidePBShrink is the
+// pure, floor-enforcing decision; pbShrinkDriver.tick is its plumbing. The FSM apply
+// of OpSetShardISR ALSO rejects a below-floor set as a structural backstop (see
+// meta_fsm.go), so a floor breach needs BOTH this driver's check to be bypassed AND
+// the FSM guard to be absent — the driver is the first line, not the only one.
 
 // pbShrinkRequest is a decided ISR shrink: at epoch, set shard's ISR to newISR
 // (the current ISR minus the confirmed-dead members). The caller commits it via
@@ -41,7 +43,8 @@ type pbShrinkRequest struct {
 }
 
 // decidePBShrink decides whether to shrink one shard's ISR to drop its stalled
-// members, ENFORCING THE minISR FLOOR (the FSM does not). It returns ok=false —
+// members, ENFORCING THE minISR FLOOR as the first line (the FSM apply enforces it
+// too, as a backstop — see meta_fsm.go's OpSetShardISR). It returns ok=false —
 // no shrink — when there is nothing removable, or when removing the dead members
 // would take the ISR below minISR (the shard then stays stalled: unavailability
 // over durability, H3). The PRIMARY is never a removal candidate (a dead primary
