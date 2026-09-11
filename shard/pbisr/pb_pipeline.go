@@ -361,8 +361,9 @@ func (e *Engine) windowWait(ctx context.Context) error {
 // commit against the smaller set without losing any acked write. It is the
 // engine-side landing point for a committed OpSetShardISR(epoch, newISR); the
 // control-plane driver calls it only AFTER observing that op committed in the
-// local MetaFSM, and only when |newISR| >= minISR (the floor is the DRIVER's
-// responsibility — the FSM does not enforce it).
+// local MetaFSM, and only when |newISR| >= minISR (the driver enforces the floor
+// as the first line; the meta FSM's OpSetShardISR apply also rejects a below-floor
+// set as a structural backstop — so a below-floor ISR can never commit at all).
 //
 // It is a NO-OP unless the shrink is for the engine's CURRENT epoch AND this node
 // still holds that epoch's lease (epoch == e.epoch && e.leaseEpoch == epoch): a
