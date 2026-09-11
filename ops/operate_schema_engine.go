@@ -805,6 +805,48 @@ func (e *schemaEngine) removeRows(pos, idx, count int) error {
 	return e.reindexTail()
 }
 
+// growCap sizes a REALLOCATION for a buffer growing by incr bytes to reach
+// need. The slack is a multiple of the INCREMENT, capped at need: a call
+// opening k gaps one at a time consumed the whole fixed +64 on the first one
+// and reallocated on nearly every gap after it.
+//
+// This is a constant-factor reduction, NOT a change of complexity. Each
+// reallocation buys 8 more gaps, so opening k gaps still costs ~k/8
+// reallocations and O(k^2) total copying once the record is larger than
+// 8*incr - about 8x fewer reallocations than the fixed +64, not amortized
+// O(1). Only while need <= 8*incr does the cap make it a true doubling.
+//
+// Real geometric growth (slack = max(8*incr, need/2)) was measured and is
+// worse in the range that matters: it saves one allocation on a 32-row insert
+// but costs ~30% more bytes on 4- and 16-row inserts, which are the common
+// shapes. Do not "fix" the asymptotics without re-measuring those.
+//
+// Scaling by the increment rather than by need is load-bearing: an earlier
+// version used need/2 and measurably REGRESSED a dynamic-mode 16-row insert
+// (+8.7% bytes for zero allocations saved), because a large record growing by
+// a little does not need slack proportional to its size.
+//
+// It is deliberately NOT used for the INITIAL reservations (copyRecord,
+// createRecord). Most calls update existing rows and open no gap at all, so
+// over-reserving up front would inflate every one of them to buy nothing.
+//
+// Nor is it used by the dynamic engine's splice, which has the same fixed +64
+// regrow: measured across 4/16/32-row inserts it saved no allocation there in
+// any case and cost a few percent more bytes, so that path keeps its +64.
+//
+// The extra capacity never reaches storage - the cache writes the record by
+// length - so it costs transient bytes only.
+func growCap(need, incr int) int {
+	slack := incr * 8
+	if slack < 64 {
+		slack = 64
+	}
+	if slack > need {
+		slack = need
+	}
+	return need + slack
+}
+
 // insertGap opens n zeroed bytes at off, growing buf in one append when its
 // capacity cannot absorb the gap.
 func insertGap(buf []byte, off, n int) []byte {
@@ -815,7 +857,7 @@ func insertGap(buf []byte, off, n int) []byte {
 	if cap(buf)-old >= n {
 		buf = buf[:old+n]
 	} else {
-		grown := make([]byte, old+n, old+n+64)
+		grown := make([]byte, old+n, growCap(old+n, n))
 		copy(grown, buf[:off])
 		copy(grown[off+n:], buf[off:old])
 		for i := off; i < off+n; i++ {
