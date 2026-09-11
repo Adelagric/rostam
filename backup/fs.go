@@ -35,13 +35,49 @@ type FSObjectStore struct {
 // compile-time assertion that FSObjectStore satisfies objstore.ObjectStore.
 var _ objstore.ObjectStore = (*FSObjectStore)(nil)
 
+// putTempPrefix is the fixed name prefix of every Put staging file. It is kept
+// out of the ".snap"/".cfg.json" key space (List/LatestKey/prune filter on
+// ".snap") so an in-flight staging file is never mistaken for a published
+// object, and it lets cleanupStaging identify leftover temps to sweep at open.
+const putTempPrefix = ".rostam-put-"
+
 // NewFSObjectStore returns an FSObjectStore rooted at root, creating root if it
-// does not exist.
+// does not exist. It also sweeps any leftover Put staging files (putTempPrefix…)
+// under root: a process killed mid-Put leaves one behind, and since retention
+// only ever lists ".snap" objects nothing else would ever reclaim it, so
+// interrupted writes would accumulate until the volume filled. The sweep is safe
+// at construction because no Put can be in flight on a store that does not exist
+// yet.
 func NewFSObjectStore(root string) (*FSObjectStore, error) {
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, fmt.Errorf("fsstore: mkdir root %q: %w", root, err)
 	}
-	return &FSObjectStore{root: root}, nil
+	f := &FSObjectStore{root: root}
+	if err := f.cleanupStaging(); err != nil {
+		return nil, fmt.Errorf("fsstore: sweep staging files under %q: %w", root, err)
+	}
+	return f, nil
+}
+
+// cleanupStaging removes leftover Put staging files (putTempPrefix…) anywhere
+// under root. Called once at construction — never concurrently with a Put — so a
+// matched file is always an abandoned temp from a previous process, never a live
+// write in progress.
+func (f *FSObjectStore) cleanupStaging() error {
+	return filepath.WalkDir(f.root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), putTempPrefix) {
+			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
+				return rmErr
+			}
+		}
+		return nil
+	})
 }
 
 // keyToPath resolves a forward-slash object key to an on-disk path under root,
@@ -93,7 +129,7 @@ func (f *FSObjectStore) Put(_ context.Context, key string, r io.Reader, size int
 	// them mid-write — a concurrent prune could delete an in-flight Put's staging
 	// file (or the temp could inflate a retention count). A ".tmp" suffix keeps it
 	// invisible to those filters until the atomic rename publishes the real key.
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".rostam-put-*.tmp")
+	tmp, err := os.CreateTemp(filepath.Dir(dst), putTempPrefix+"*.tmp")
 	if err != nil {
 		return fmt.Errorf("fsstore: temp for %q: %w", key, err)
 	}

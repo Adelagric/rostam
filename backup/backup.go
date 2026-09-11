@@ -198,7 +198,10 @@ func backupOne(ctx context.Context, store *vector.CollectionStore, obj objstore.
 	// snapshot written first, an interruption between the two Puts would leave a
 	// selectable snapshot with no config; this order can only ever leave an orphan
 	// config with no snapshot, which LatestKey/prune ignore (they filter on .snap)
-	// and a later run overwrites. We reuse the same JSON marshal the store uses for
+	// — harmless, though not self-healing: later runs use a distinct timestamp key,
+	// so an orphan config persists until a same-timestamp overwrite or a manual
+	// sweep (prune only deletes configs paired with a pruned snapshot). We reuse
+	// the same JSON marshal the store uses for
 	// its on-disk <col>.json sidecar.
 	cfgData, err := json.Marshal(c.Config())
 	if err != nil {
