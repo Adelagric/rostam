@@ -331,6 +331,19 @@ const minRetBytes = 1 + 1
 // than silently truncating or wrapping, for any field that cannot be
 // represented on the wire or that exceeds a cap (design doc §2.7).
 func EncodeOperateArgs(a *OperateArgs) ([]byte, error) {
+	return AppendOperateArgs(nil, a)
+}
+
+// AppendOperateArgs is EncodeOperateArgs appending into dst (reusing its
+// capacity when large enough), for a hot-loop caller that pools the buffer —
+// the same pair EncodeKeyArgs/AppendKeyArgs already form for point ops.
+// Passing dst=nil reproduces EncodeOperateArgs's bytes exactly. The returned
+// slice may alias dst.
+//
+// A caller that pools dst across calls allocates nothing here once the buffer
+// has grown to the largest op list it builds: an operate call's encoding is
+// otherwise dominated by appendOp growing a fresh buffer per call.
+func AppendOperateArgs(dst []byte, a *OperateArgs) ([]byte, error) {
 	if len(a.Key) > 0xFFFF {
 		return nil, ErrOperateCap
 	}
@@ -356,7 +369,11 @@ func EncodeOperateArgs(a *OperateArgs) ([]byte, error) {
 		return nil, ErrOperateArgs
 	}
 
-	buf := make([]byte, 0, 2+len(a.Key)+8+1+1+2+len(a.Schema)+2+2)
+	n := 2 + len(a.Key) + 8 + 1 + 1 + 2 + len(a.Schema) + 2 + 2
+	buf := dst[:0]
+	if cap(buf) < n {
+		buf = make([]byte, 0, n)
+	}
 	buf = binary.BigEndian.AppendUint16(buf, uint16(len(a.Key))) //nolint:gosec // bounded by the check above
 	buf = append(buf, a.Key...)
 	buf = binary.BigEndian.AppendUint64(buf, uint64(a.TTL/time.Millisecond)) //nolint:gosec // duration to milliseconds always non-negative
@@ -404,26 +421,64 @@ func EncodeOperateArgs(a *OperateArgs) ([]byte, error) {
 // bound, and it closes the KV operate path (where args is the whole request
 // body) at the same time.
 func DecodeOperateArgs(b []byte) (*OperateArgs, error) {
-	a, n, err := decodeOperateArgsN(b)
-	if err != nil {
+	a := new(OperateArgs)
+	if err := DecodeOperateArgsInto(a, b); err != nil {
 		return nil, err
-	}
-	if n != len(b) {
-		return nil, ErrOperateArgs
 	}
 	return a, nil
 }
 
+// DecodeOperateArgsInto is DecodeOperateArgs decoding into dst, reusing the
+// capacity of dst.Ops and dst.Rets instead of allocating a fresh slice per
+// call. It is for a hot-path caller that pools the struct: the server decodes
+// one OperateArgs per operate request, and that op slice is the single largest
+// allocation on the apply path (an op list of n bidders x ~4 ops per bidder).
+//
+// Every field of dst is overwritten, so a pooled dst carries nothing from its
+// previous use. A dst that already has capacity KEEPS it, so a frame carrying
+// no ops decodes to an empty-but-non-nil dst.Ops where DecodeOperateArgs
+// would return nil - read len(dst.Ops), never dst.Ops == nil. A fresh dst
+// (nil slices) decodes identically to DecodeOperateArgs.
+//
+// On error dst is reset to empty rather than left untouched - see the error
+// branch for why.
+//
+// A path addressed by NAME still allocates that name's string per segment;
+// schema mode addresses by position and so decodes with no allocation at all
+// once dst has grown.
+//
+// The same aliasing rule applies as for DecodeOperateArgs: Key, Schema, Bytes,
+// Name and path-Key fields may point into b, so dst must not outlive b.
+func DecodeOperateArgsInto(dst *OperateArgs, b []byte) error {
+	n, err := decodeOperateArgsN(dst, b)
+	if err == nil && n != len(b) {
+		err = ErrOperateArgs
+	}
+	if err != nil {
+		// dst is left EMPTY, not untouched: the decoder appends into dst's
+		// backing array as it goes, so a call that fails partway has already
+		// overwritten elements that dst's old length still covers. Resetting
+		// is the only cheap state a caller can rely on, and clearing releases
+		// the failed call's buffer.
+		ops, rets := dst.Ops[:0], dst.Rets[:0]
+		clear(ops[:cap(ops)])
+		clear(rets[:cap(rets)])
+		*dst = OperateArgs{Ops: ops, Rets: rets}
+		return err
+	}
+	return nil
+}
+
 // decodeOperateArgsN is DecodeOperateArgs' body, reporting how many bytes it
 // consumed so the exported wrapper can insist that be all of them.
-func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
+func decodeOperateArgsN(dst *OperateArgs, b []byte) (int, error) {
 	if len(b) < 2 {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
 	klen := int(binary.BigEndian.Uint16(b[0:2]))
 	off := 2
 	if len(b)-off < klen {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
 	var key []byte
 	if klen > 0 {
@@ -432,11 +487,11 @@ func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 	off += klen
 
 	if len(b)-off < 8+1+1+2 { // ttlMs(8) + ttlMode(1) + create(1) + schemaLen(2)
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
 	ttl, err := ttlFromMs(binary.BigEndian.Uint64(b[off : off+8]))
 	if err != nil {
-		return nil, 0, err
+		return 0, err
 	}
 	off += 8
 	ttlMode := b[off]
@@ -444,16 +499,16 @@ func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 	create := b[off]
 	off++
 	if ttlMode > OperateTTLCreateOnly {
-		return nil, 0, ErrOperateArgs
+		return 0, ErrOperateArgs
 	}
 	if create > OperateCreateDynamic {
-		return nil, 0, ErrOperateArgs
+		return 0, ErrOperateArgs
 	}
 
 	schemaLen := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
 	if len(b)-off < schemaLen {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
 	var schema []byte
 	if schemaLen > 0 {
@@ -462,7 +517,7 @@ func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 	off += schemaLen
 
 	if len(b)-off < 2 {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
 	nOps := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
@@ -471,18 +526,26 @@ func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 	// than a call may carry), while a count the remaining bytes cannot
 	// possibly hold is a truncated frame.
 	if nOps > OperateMaxOps {
-		return nil, 0, ErrOperateCap
+		return 0, ErrOperateCap
 	}
 	if !CountFitsIn(nOps, len(b)-off, minOpBytes) {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
-	var ops []OperateOp
+	// dst.Ops[:0] on a nil slice is still nil, so a fresh dst keeps
+	// DecodeOperateArgs's "nil when the frame carries none" shape while a
+	// pooled one reuses whatever capacity it already had.
+	oldOps := len(dst.Ops)
+	ops := dst.Ops[:0]
+	reusedOps := true
 	if nOps > 0 {
-		ops = make([]OperateOp, 0, nOps)
+		if cap(ops) < nOps {
+			ops = make([]OperateOp, 0, nOps)
+			reusedOps = false
+		}
 		for i := 0; i < nOps; i++ {
 			op, n, oerr := decodeOp(b[off:])
 			if oerr != nil {
-				return nil, 0, oerr
+				return 0, oerr
 			}
 			ops = append(ops, op)
 			off += n
@@ -490,30 +553,46 @@ func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 	}
 
 	if len(b)-off < 2 {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
 	nRet := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
 	if nRet > OperateMaxRet {
-		return nil, 0, ErrOperateCap
+		return 0, ErrOperateCap
 	}
 	if !CountFitsIn(nRet, len(b)-off, minRetBytes) {
-		return nil, 0, ErrShortArgs
+		return 0, ErrShortArgs
 	}
-	var rets []OperateRet
+	oldRets := len(dst.Rets)
+	rets := dst.Rets[:0]
+	reusedRets := true
 	if nRet > 0 {
-		rets = make([]OperateRet, 0, nRet)
+		if cap(rets) < nRet {
+			rets = make([]OperateRet, 0, nRet)
+			reusedRets = false
+		}
 		for i := 0; i < nRet; i++ {
 			ret, n, rerr := decodeRet(b[off:])
 			if rerr != nil {
-				return nil, 0, rerr
+				return 0, rerr
 			}
 			rets = append(rets, ret)
 			off += n
 		}
 	}
 
-	return &OperateArgs{
+	// A reused slice that shrank still holds the previous call's ops past its
+	// new length, and those keep that call's request buffer alive. Clearing
+	// just the shrink delta is enough: by induction everything past the old
+	// length was already cleared by the decode that shrank it.
+	if reusedOps && len(ops) < oldOps {
+		clear(ops[len(ops):oldOps])
+	}
+	if reusedRets && len(rets) < oldRets {
+		clear(rets[len(rets):oldRets])
+	}
+
+	*dst = OperateArgs{
 		Key:     key,
 		TTL:     ttl,
 		TTLMode: ttlMode,
@@ -521,7 +600,8 @@ func decodeOperateArgsN(b []byte) (*OperateArgs, int, error) {
 		Schema:  schema,
 		Ops:     ops,
 		Rets:    rets,
-	}, off, nil
+	}
+	return off, nil
 }
 
 // EncodeOperateResult encodes an operate result frame (design doc §3.4):

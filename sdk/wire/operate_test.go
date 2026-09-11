@@ -3,6 +3,7 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"math"
@@ -318,5 +319,267 @@ func TestDecodeOperateResultCountErrors(t *testing.T) {
 	binary.BigEndian.PutUint16(short[1:], OperateMaxRet)
 	if _, err := DecodeOperateResult(short); !errors.Is(err, ErrShortArgs) {
 		t.Fatalf("nRet within the cap but past the byte budget: err = %v, want ErrShortArgs", err)
+	}
+}
+
+// AppendOperateArgs must be byte-identical to EncodeOperateArgs whether it
+// allocates its own buffer or reuses one, or a pooling caller would put
+// different bytes on the wire than a plain one.
+func TestAppendOperateArgsMatchesEncode(t *testing.T) {
+	a := sampleArgs()
+	want, err := EncodeOperateArgs(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nilDst, err := AppendOperateArgs(nil, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(nilDst, want) {
+		t.Errorf("nil dst:\n got %x\nwant %x", nilDst, want)
+	}
+
+	// A buffer too small to hold even the header, and one large enough for the
+	// whole frame, must both produce the same bytes.
+	for _, size := range []int{0, 4, len(want), 4 * len(want)} {
+		got, aErr := AppendOperateArgs(make([]byte, 0, size), a)
+		if aErr != nil {
+			t.Fatal(aErr)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("dst cap %d:\n got %x\nwant %x", size, got, want)
+		}
+	}
+
+	// Dirty buffers must be overwritten, not appended to.
+	dirty := make([]byte, 8*len(want))
+	for i := range dirty {
+		dirty[i] = 0xAA
+	}
+	got, err := AppendOperateArgs(dirty, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("dirty dst:\n got %x\nwant %x", got, want)
+	}
+}
+
+// The reason the function exists: a pooled buffer must make the encode
+// allocation-free once it has grown.
+func TestAppendOperateArgsZeroAllocOnWarmBuffer(t *testing.T) {
+	a := sampleArgs()
+	buf, err := AppendOperateArgs(nil, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := testing.AllocsPerRun(100, func() {
+		buf, _ = AppendOperateArgs(buf[:0], a)
+	}); n != 0 {
+		t.Errorf("AppendOperateArgs on a warm buffer allocated %v times, want 0", n)
+	}
+}
+
+// A pooled dst must decode byte-identically to a fresh one, and must carry
+// nothing from its previous use - a stale Key or Schema would be read as the
+// current call's.
+func TestDecodeOperateArgsIntoMatchesDecode(t *testing.T) {
+	full, err := EncodeOperateArgs(sampleArgs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A deliberately different second frame: no ops, no rets, no schema.
+	bare, err := EncodeOperateArgs(&OperateArgs{Key: []byte("k"), Create: OperateCreateDynamic})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, order := range [][][]byte{{full, bare}, {bare, full}, {full, full}, {bare, bare}} {
+		dst := new(OperateArgs)
+		for i, frame := range order {
+			want, dErr := DecodeOperateArgs(frame)
+			if dErr != nil {
+				t.Fatal(dErr)
+			}
+			if iErr := DecodeOperateArgsInto(dst, frame); iErr != nil {
+				t.Fatal(iErr)
+			}
+			// Compared field by field rather than with DeepEqual: a reused
+			// dst keeps its slice capacity, so an op-less frame decodes to
+			// an EMPTY Ops rather than the nil a fresh decode produces.
+			// Semantically identical, and len() is what every caller uses.
+			if !bytes.Equal(dst.Key, want.Key) || dst.TTL != want.TTL ||
+				dst.TTLMode != want.TTLMode || dst.Create != want.Create ||
+				!bytes.Equal(dst.Schema, want.Schema) ||
+				!reflect.DeepEqual(dst.Ops, want.Ops) && (len(dst.Ops) != 0 || len(want.Ops) != 0) ||
+				!reflect.DeepEqual(dst.Rets, want.Rets) && (len(dst.Rets) != 0 || len(want.Rets) != 0) {
+				t.Fatalf("reuse %d:\n got %+v\nwant %+v", i, dst, want)
+			}
+		}
+	}
+}
+
+// Reuse must not allocate once the op slice has grown. Uses schema-POSITION
+// paths only: a path addressed by NAME decodes its name with string(b[...]),
+// which allocates per segment no matter how the op slice is managed. Schema
+// mode - the hot path this pool exists for - always addresses by position.
+func TestDecodeOperateArgsIntoZeroAllocOnWarmDst(t *testing.T) {
+	positional := &OperateArgs{
+		Key: []byte("session:42"), Create: OperateCreateSchema,
+		Schema: sessionSchema().Encode(),
+		Ops: []OperateOp{
+			{Opcode: OperateOpADD, Type: OperateTypeFromSchema, Path: OperatePath{Kind: OperatePathField, Field: OperateSeg{Pos: 0}}, A: 1},
+			{Opcode: OperateOpSHL, Type: OperateTypeFromSchema, Path: OperatePath{Kind: OperatePathCol, Field: OperateSeg{Pos: 3}, Key: []byte{1, 0, 0, 0, 0, 0, 0, 0}, Col: OperateSeg{Pos: 0}}, A: 2},
+		},
+		Rets: []OperateRet{{Mode: OperateRetCount, Path: OperatePath{Kind: OperatePathField, Field: OperateSeg{Pos: 3}}}},
+	}
+	b, err := EncodeOperateArgs(positional)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := new(OperateArgs)
+	if err = DecodeOperateArgsInto(dst, b); err != nil {
+		t.Fatal(err)
+	}
+	if n := testing.AllocsPerRun(100, func() {
+		_ = DecodeOperateArgsInto(dst, b)
+	}); n != 0 {
+		t.Errorf("DecodeOperateArgsInto on a warm dst allocated %v times, want 0", n)
+	}
+}
+
+// A failed decode must leave dst EMPTY, not holding the previous call's data.
+// The decoder appends into dst's backing array as it goes, so a call that
+// fails partway has already overwritten elements the old length still covers -
+// a reusing caller that trusted the old contents would read a mix of two calls.
+func TestDecodeOperateArgsIntoResetsOnError(t *testing.T) {
+	good, err := EncodeOperateArgs(sessionShapedArgs(8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := new(OperateArgs)
+	if err = DecodeOperateArgsInto(dst, good); err != nil {
+		t.Fatal(err)
+	}
+	if len(dst.Ops) == 0 {
+		t.Fatal("seed decode produced no ops; the test proves nothing")
+	}
+
+	for name, bad := range map[string][]byte{
+		"trailing bytes": append(append([]byte(nil), good...), 0xFF),
+		"truncated":      good[:len(good)-1],
+		"truncated hard": good[:len(good)/2],
+	} {
+		if err = DecodeOperateArgsInto(dst, bad); err == nil {
+			t.Fatalf("%s: expected an error", name)
+		}
+		if len(dst.Ops) != 0 || len(dst.Rets) != 0 || dst.Key != nil || dst.Schema != nil {
+			t.Errorf("%s: dst not reset after a failed decode: %+v", name, dst)
+		}
+		// Re-seed so the next case starts from a populated dst again.
+		if err = DecodeOperateArgsInto(dst, good); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Shrinking a reused dst must not leave the previous call's ops reachable past
+// the new length - they alias that call's request buffer and would pin it.
+func TestDecodeOperateArgsIntoClearsStaleTail(t *testing.T) {
+	big, err := EncodeOperateArgs(sessionShapedArgs(16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	small, err := EncodeOperateArgs(sessionShapedArgs(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dst := new(OperateArgs)
+	if err = DecodeOperateArgsInto(dst, big); err != nil {
+		t.Fatal(err)
+	}
+	bigOps, bigRets := len(dst.Ops), len(dst.Rets)
+	if err = DecodeOperateArgsInto(dst, small); err != nil {
+		t.Fatal(err)
+	}
+	if len(dst.Ops) >= bigOps {
+		t.Fatalf("small frame decoded to %d ops, want fewer than %d", len(dst.Ops), bigOps)
+	}
+
+	opTail := dst.Ops[:cap(dst.Ops)][len(dst.Ops):bigOps]
+	for i := range opTail {
+		if !reflect.DeepEqual(opTail[i], OperateOp{}) {
+			t.Fatalf("stale op at tail index %d still set: %+v", i, opTail[i])
+		}
+	}
+	if len(dst.Rets) >= bigRets {
+		t.Fatalf("small frame decoded to %d rets, want fewer than %d", len(dst.Rets), bigRets)
+	}
+	retTail := dst.Rets[:cap(dst.Rets)][len(dst.Rets):bigRets]
+	for i := range retTail {
+		if !reflect.DeepEqual(retTail[i], OperateRet{}) {
+			t.Fatalf("stale ret at tail index %d still set: %+v", i, retTail[i])
+		}
+	}
+}
+
+// sessionShapedArgs is a realistic hot-path call: one record touched for
+// nBidders keys, ~4 position-addressed ops each, the shape a session cache
+// sends per auction.
+func sessionShapedArgs(nBidders int) *OperateArgs {
+	a := &OperateArgs{
+		Key: []byte("session:42"), Create: OperateCreateSchema,
+		TTL: 2 * time.Hour, TTLMode: OperateTTLSet,
+		Schema: sessionSchema().Encode(),
+	}
+	for i := range nBidders {
+		row := []byte{byte(i), byte(i >> 8), 0, 0, 0, 0, 0, 0}
+		col := func(c uint32) OperatePath {
+			return OperatePath{Kind: OperatePathCol, Field: OperateSeg{Pos: 3}, Key: row, Col: OperateSeg{Pos: c}}
+		}
+		a.Ops = append(a.Ops,
+			OperateOp{Opcode: OperateOpADD, Type: OperateTypeFromSchema, Path: col(0), A: 1},
+			OperateOp{Opcode: OperateOpSHL, Type: OperateTypeFromSchema, Path: col(1), A: 2},
+			OperateOp{Opcode: OperateOpOR, Type: OperateTypeFromSchema, Path: col(1), A: 3},
+			OperateOp{Opcode: OperateOpADD, Type: OperateTypeFromSchema, Path: col(2), A: 1},
+		)
+		// One return per key, so Rets scales with nBidders too - a fixed-size
+		// Rets would leave the rets shrink-clear path untested.
+		a.Rets = append(a.Rets, OperateRet{
+			Mode: OperateRetValue,
+			Path: OperatePath{Kind: OperatePathRow, Field: OperateSeg{Pos: 3}, Key: row},
+		})
+	}
+	return a
+}
+
+func BenchmarkDecodeOperateArgs(b *testing.B) {
+	buf, err := EncodeOperateArgs(sessionShapedArgs(16))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := DecodeOperateArgs(buf); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecodeOperateArgsInto(b *testing.B) {
+	buf, err := EncodeOperateArgs(sessionShapedArgs(16))
+	if err != nil {
+		b.Fatal(err)
+	}
+	dst := new(OperateArgs)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := DecodeOperateArgsInto(dst, buf); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
