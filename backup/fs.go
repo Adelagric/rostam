@@ -64,20 +64,27 @@ func NewFSObjectStore(root string) (*FSObjectStore, error) {
 // matched file is always an abandoned temp from a previous process, never a live
 // write in progress.
 func (f *FSObjectStore) cleanupStaging() error {
-	return filepath.WalkDir(f.root, func(p string, d fs.DirEntry, err error) error {
+	// Collect during the walk and delete AFTER it, never inside the callback: a
+	// filesystem mutation in a WalkDir callback races the walk's own path
+	// resolution (gosec G122), so gather the paths first, then remove them.
+	var stale []string
+	if err := filepath.WalkDir(f.root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() {
-			return nil
-		}
-		if strings.HasPrefix(d.Name(), putTempPrefix) {
-			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
-				return rmErr
-			}
+		if !d.IsDir() && strings.HasPrefix(d.Name(), putTempPrefix) {
+			stale = append(stale, p)
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	for _, p := range stale {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 // keyToPath resolves a forward-slash object key to an on-disk path under root,
