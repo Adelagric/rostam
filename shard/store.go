@@ -851,6 +851,11 @@ func (s *Store) LastIndex() uint64 { return s.raft.LastIndex() }
 // signal online rebalancing polls on a joining replica.
 func (s *Store) RaftAppliedIndex() uint64 { return s.raft.AppliedIndex() }
 
+// CacheStats returns this shard's CACHE stats only, without the raft half that
+// Stats also collects. The KV metrics scrape wants the cache counters and
+// nothing else.
+func (s *Store) CacheStats() cache.Stats { return s.cache.Stats() }
+
 // Stats returns combined cache + raft stats.
 func (s *Store) Stats() Stats {
 	return Stats{
