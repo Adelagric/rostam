@@ -121,6 +121,13 @@ func TestFSObjectStoreListPrefixScopedWalk(t *testing.T) {
 		"beta/col/2024-01-01T00:00:00Z.snap",
 		"top.snap",
 	}
+	if runtime.GOOS != "windows" {
+		// A literal backslash in a name: scoping must stop before that segment
+		// and let the lexical filter decide, so such keys still list — and a
+		// prefix with a backslash in a complete segment still matches nothing
+		// that a full-root walk would not have matched.
+		keys = append(keys, "bs/x\\y.snap")
+	}
 	for _, k := range keys {
 		if err := fsStore.Put(ctx, k, strings.NewReader(k), int64(len(k))); err != nil {
 			t.Fatalf("put %q: %v", k, err)
@@ -160,7 +167,7 @@ func TestFSObjectStoreListPrefixScopedWalk(t *testing.T) {
 		"", "acme/", "acme/col/", "acme/col/2024-", "acme/col/2024-01-01T00:00:00Z.snap",
 		"acme/co", "top", "nope/", "acme/nope/2024-", "../", "../outside", "/acme/col/",
 		"top.snap/", "top.snap/x/y", "acme/col/2024-01-01T00:00:00Z.snap/x/",
-		"a\x00b/", "acme/\x00/",
+		"a\x00b/", "acme/\x00/", "bs/x\\", "bs\\x/", "bs\\x/y", "acme\\col/",
 	} {
 		got, want := listKeys(prefix), fullWalk(prefix)
 		if strings.Join(got, ",") != strings.Join(want, ",") {
@@ -198,15 +205,24 @@ func TestFSObjectStoreListRefusesSymlinkStart(t *testing.T) {
 	if err := os.Symlink(filepath.Join(root, "acme"), filepath.Join(root, "inlink")); err != nil {
 		t.Fatal(err)
 	}
+	// RELATIVE in-root links are the ones os.Root itself would follow (it only
+	// refuses absolute and root-escaping targets), so they are the real test of
+	// the per-component Lstat: one at the top, one below the tenant directory.
+	if err := os.Symlink("acme", filepath.Join(root, "rel")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("col", filepath.Join(root, "acme", "relcol")); err != nil {
+		t.Fatal(err)
+	}
 
-	for _, prefix := range []string{"link/", "link/col/", "inlink/", "inlink/col/"} {
+	for _, prefix := range []string{"link/", "link/col/", "inlink/", "inlink/col/", "rel/", "rel/col/", "acme/relcol/"} {
 		infos, err := fsStore.List(ctx, prefix)
 		if err == nil {
 			t.Errorf("list %q through a symlink: want an error, got %d keys", prefix, len(infos))
 		}
 		for _, in := range infos {
-			if strings.HasPrefix(in.Key, "link/") {
-				t.Errorf("list %q escaped root: %q", prefix, in.Key)
+			if strings.HasPrefix(in.Key, "link/") || strings.HasPrefix(in.Key, "rel/") || strings.HasPrefix(in.Key, "acme/relcol/") {
+				t.Errorf("list %q resolved a symlink: %q", prefix, in.Key)
 			}
 		}
 	}
@@ -219,7 +235,7 @@ func TestFSObjectStoreListRefusesSymlinkStart(t *testing.T) {
 	for _, in := range infos {
 		got = append(got, in.Key)
 	}
-	if want := "acme/col/2024-01-01T00:00:00Z.snap,inlink,link"; strings.Join(got, ",") != want {
+	if want := "acme/col/2024-01-01T00:00:00Z.snap,acme/relcol,inlink,link,rel"; strings.Join(got, ",") != want {
 		t.Errorf("root list = %v, want %s", got, want)
 	}
 	// The file behind the escaping link was never touched.

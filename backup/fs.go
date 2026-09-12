@@ -170,16 +170,20 @@ func (f *FSObjectStore) Get(_ context.Context, key string) (io.ReadCloser, error
 // every entry, so the result is what a full-root walk filtered by prefix would
 // return.
 //
-// The walk runs inside os.Root, so it cannot leave root through a symlink: the
-// kernel-level check refuses a start path with a symlink in ANY component —
-// even one that stays inside root — rather than resolving it. A full-root walk
-// never descended into a symlink either, so nothing under one was ever
-// listable; the difference is that it stayed silent, whereas List now returns
-// an error. That is deliberate: a tenant directory an operator symlinked onto
-// another disk otherwise surfaces as "no snapshots" from LatestKey/RestoreLatest
-// and as a silent no-op from prune, when the truth is that List cannot see it.
-// path.Clean on the prefix is the only lexical defence and it is not relied on
-// for containment.
+// Symlinks are never followed. A full-root walk never descended into one, so
+// nothing under a symlink was ever listable; a scoped walk must not resolve
+// one on its way to the start directory either, or it would list — and let
+// retention delete — files under keys the full walk never produced. Two layers
+// enforce that. Every component between root and the start directory is
+// Lstat'd and a symlink is an ERROR (where the full walk was silent — that is
+// deliberate: a tenant directory an operator symlinked onto another disk
+// otherwise surfaces as "no snapshots" from LatestKey/RestoreLatest and as a
+// silent no-op from prune, when the truth is that List cannot see it). Behind
+// that, the walk runs inside os.Root, so even a link created between the Lstat
+// and the walk cannot leave root: os.Root refuses absolute and root-escaping
+// link targets outright, and a relative in-root link — which os.Root itself
+// WOULD follow — can at worst alias in-root files. path.Clean on the prefix is
+// the only lexical step and it is not relied on for containment.
 //
 // Error semantics, matching MemStore.List (a pure prefix filter, which cannot
 // fail on the SHAPE of a prefix): a prefix whose directory does not exist yet,
@@ -207,16 +211,15 @@ func (f *FSObjectStore) List(_ context.Context, prefix string) ([]objstore.Objec
 		return nil, fmt.Errorf("fsstore: list %q: open root: %w", prefix, err)
 	}
 	defer func() { _ = r.Close() }()
-	fsys := r.FS()
-	start := listStart(prefix)
-	if _, err := fs.Stat(fsys, start); err != nil {
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
-			return nil, nil // no such prefix: nothing to list
-		}
+	start, ok, err := listStart(r, prefix)
+	if err != nil {
 		return nil, fmt.Errorf("fsstore: list %q: %w", prefix, err)
 	}
+	if !ok {
+		return nil, nil // no such prefix: nothing to list
+	}
 	var out []objstore.ObjectInfo
-	err = fs.WalkDir(fsys, start, func(p string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(r.FS(), start, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -246,20 +249,48 @@ func (f *FSObjectStore) List(_ context.Context, prefix string) ([]objstore.Objec
 }
 
 // listStart returns the fs.FS path (unrooted, slash-separated, "." for root)
-// List should walk for prefix: every COMPLETE "/"-separated segment of prefix.
-// The trailing partial segment, if any, is a name filter, not a directory.
+// List should walk for prefix: every COMPLETE "/"-separated segment of prefix
+// that exists as a real directory. The trailing partial segment, if any, is a
+// name filter, not a directory. ok=false means the walk would yield nothing
+// (a segment is missing or is a plain file); a symlink segment is an error
+// (see List). Scoping stops at the first segment containing a backslash and
+// walks from its parent instead: on Windows os.Root would treat "\\" as a
+// separator while the key filter treats it as a literal, so a scoped walk
+// there could return keys that do not carry the requested prefix — walking
+// from the parent lets the lexical filter decide, identically everywhere.
 // path.Clean resolves "."/".." and a leading "/" lexically; containment itself
 // is enforced by os.Root, not here.
-func listStart(prefix string) string {
+func listStart(r *os.Root, prefix string) (start string, ok bool, err error) {
+	start = "."
 	i := strings.LastIndex(prefix, "/")
 	if i < 0 {
-		return "."
+		return start, true, nil
 	}
 	rel := strings.TrimPrefix(path.Clean("/"+prefix[:i]), "/")
 	if rel == "" {
-		return "."
+		return start, true, nil
 	}
-	return rel
+	for _, seg := range strings.Split(rel, "/") {
+		if strings.ContainsRune(seg, '\\') {
+			break
+		}
+		next := path.Join(start, seg)
+		info, lerr := r.Lstat(next)
+		if lerr != nil {
+			if errors.Is(lerr, fs.ErrNotExist) || errors.Is(lerr, syscall.ENOTDIR) {
+				return "", false, nil
+			}
+			return "", false, lerr
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			return "", false, fmt.Errorf("%q is a symlink: refusing to list through it", next)
+		}
+		if !info.IsDir() {
+			return "", false, nil // a plain file cannot hold keys beneath it
+		}
+		start = next
+	}
+	return start, true, nil
 }
 
 // Delete removes <root>/<key>. Deleting a missing key returns
