@@ -36,10 +36,14 @@ import (
 // cur ownership: tx.GetWithExpiryInto copies the stored record into a pooled
 // buffer, so cur is owned by this call rather than aliasing the cache's page.
 // It still must not outlive the handler - the buffer goes back to the pool on
-// return - and nothing here needs it to: applyRecordBytes copies it again
-// before making any change (openRecord -> copyRecord) and returns its own,
-// freshly allocated out, and this handler never writes through cur nor touches
-// it once applyRecordBytes has been called.
+// return - and nothing here needs it to: the apply path copies it again before
+// making any change (openRecord -> copyRecord) and this handler never writes
+// through cur nor touches it once the apply has been called.
+//
+// out ownership: out comes from a SECOND pooled buffer (operateWriteBufPool),
+// not a fresh allocation, and may alias it. It is valid until this handler's
+// deferred recycle, which is after tx.Put has copied the bytes into the page
+// arena and after the reply frame has been encoded.
 // operateArgsPool recycles the decoded call. The op slice is the single
 // largest allocation on this path - one operate request carries up to
 // OperateMaxOps ops, and a caller that touches many keys in one call sends a
@@ -61,6 +65,21 @@ var operateArgsPool = sync.Pool{New: func() any { return new(wire.OperateArgs) }
 const maxPooledReadBuf = 64 << 10
 
 var operateReadBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
+
+// operateWriteBufPool backs the private record copy the apply path works on
+// (copyRecord). It is separate from operateReadBufPool because a call needs
+// BOTH at once: the stored bytes are read into one and copied into the other,
+// which the engine then patches in place. Same maxPooledReadBuf guard, for the
+// same reason — a record may reach maxOperateRecordBytes, and pooling
+// unconditionally would let a few outsized keys pin a large array per slot.
+var operateWriteBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
+
+func putOperateWriteBuf(bp *[]byte) {
+	if cap(*bp) <= maxPooledReadBuf {
+		*bp = (*bp)[:0]
+		operateWriteBufPool.Put(bp)
+	}
+}
 
 func putOperateReadBuf(bp *[]byte) {
 	if cap(*bp) <= maxPooledReadBuf {
@@ -109,8 +128,35 @@ func handleOperate(tx *TxContext, args []byte) ([]byte, error) {
 		cur = nil
 	}
 
+	// The apply path's working copy of the record. Recycling it is what makes a
+	// warm in-place update allocate nothing: copyRecord reuses this array, and a
+	// record that grew keeps the larger array for the next call, so insertGap
+	// stops reallocating on every write to a steady-state record.
+	//
+	// *wb = out, not the buffer passed in, is a CAPACITY contract rather than a
+	// safety one. insertGap replaces the array when the record outgrows it, and
+	// at that point the two arrays no longer alias — recycling the original
+	// would be harmless, it would just pool the smaller array forever and make
+	// the next call reallocate. Keeping out is what lets a record that reached
+	// its working size stop growing on every write. Guarded on out != nil so a
+	// delete or a failed CHECK (both of which return no bytes) keeps whatever
+	// capacity the slot already had.
+	//
+	// The real lifetime constraint is ordering, and the defer supplies it: the
+	// buffer goes back to the pool only after tx.Put has copied the record into
+	// the page arena and after the reply frame has been encoded, so nothing
+	// still reads out when it is recycled.
+	//
+	// Buffers grown past maxPooledReadBuf are dropped rather than pooled, so a
+	// record larger than that does not keep its array across calls.
+	wb, _ := operateWriteBufPool.Get().(*[]byte)
+	defer func() { putOperateWriteBuf(wb) }()
+
 	stampMs, _ := tx.applyStamp()
-	out, deleted, res, err := applyRecordBytes(cur, a, stampMs)
+	out, deleted, res, err := applyRecordBytesInto((*wb)[:0], cur, a, stampMs)
+	if out != nil {
+		*wb = out
+	}
 	if err != nil {
 		if errors.Is(err, errOperateAbsent) {
 			// design doc §3.5: create = NONE against an absent key is the

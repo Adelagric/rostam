@@ -60,6 +60,31 @@ type engines struct {
 // never an alias of cur: the caller can write it back without thinking about
 // the store's own page.
 func applyRecordBytes(cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, wire.OperateResult, error) {
+	return applyRecordBytesInto(nil, cur, a, stampMs)
+}
+
+// applyRecordBytesInto is applyRecordBytes with a caller-owned scratch buffer
+// for the private record copy — the one allocation the in-place path otherwise
+// costs (design doc §2.6).
+//
+// scratch may be nil, in which case this is exactly applyRecordBytes.
+//
+// The returned out ALIASES scratch whenever scratch's array had room — which
+// includes a record that GREW, since insertGap extends in place while capacity
+// allows (`cap(buf)-old >= n`) and only allocates a replacement when it does
+// not. So growth alone does not tell a caller whether out is a new array;
+// capacity does, and the caller cannot see it.
+//
+// A caller recycling the scratch should recycle what out POINTS AT, but that is
+// a CAPACITY contract, not a safety one: when growth allocated a replacement the
+// two arrays no longer alias, so keeping the original is harmless — it just
+// discards the larger array and makes the next call grow again.
+//
+// The safety constraint is ordering: out stays valid only until the caller
+// reuses the scratch, so everything that reads out must happen first. tx.Put
+// copies the bytes into the shard's page arena (encodeEntry), so the store
+// itself never holds onto it.
+func applyRecordBytesInto(scratch, cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, wire.OperateResult, error) {
 	if len(a.Ops) > wire.OperateMaxOps || len(a.Rets) > wire.OperateMaxRet {
 		return nil, false, wire.OperateResult{}, wire.ErrOperateCap
 	}
@@ -67,7 +92,7 @@ func applyRecordBytes(cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, b
 		se: schemaEnginePool.Get().(*schemaEngine),   //nolint:errcheck,forcetypeassert // the pool's New returns exactly this
 		de: dynamicEnginePool.Get().(*dynamicEngine), //nolint:errcheck,forcetypeassert // the pool's New returns exactly this
 	}
-	out, deleted, res, err := applyWithEngine(es, cur, a, stampMs)
+	out, deleted, res, err := applyWithEngine(es, scratch, cur, a, stampMs)
 	es.se.clear()
 	es.de.clear()
 	schemaEnginePool.Put(es.se)
@@ -75,8 +100,8 @@ func applyRecordBytes(cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, b
 	return out, deleted, res, err
 }
 
-func applyWithEngine(es engines, cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, wire.OperateResult, error) {
-	e, err := openRecord(es, cur, a)
+func applyWithEngine(es engines, scratch, cur []byte, a *wire.OperateArgs, stampMs int64) ([]byte, bool, wire.OperateResult, error) {
+	e, err := openRecord(es, scratch, cur, a)
 	if err != nil {
 		return nil, false, wire.OperateResult{}, err
 	}
@@ -126,7 +151,7 @@ func applyWithEngine(es engines, cur []byte, a *wire.OperateArgs, stampMs int64)
 // openRecord resolves the call's `create` parameter against the stored record
 // (design doc §3.5) and returns an engine over a private, patchable copy of
 // the bytes to apply the ops to.
-func openRecord(es engines, cur []byte, a *wire.OperateArgs) (modeEngine, error) {
+func openRecord(es engines, scratch, cur []byte, a *wire.OperateArgs) (modeEngine, error) {
 	if cur == nil {
 		return createRecord(es, a)
 	}
@@ -160,7 +185,7 @@ func openRecord(es engines, cur []byte, a *wire.OperateArgs) (modeEngine, error)
 		return nil, wire.ErrOperateArgs
 	}
 
-	buf, err := copyRecord(cur)
+	buf, err := copyRecord(scratch, cur)
 	if err != nil {
 		return nil, err
 	}
@@ -243,16 +268,30 @@ func openMode(es engines, buf []byte, existed bool) (modeEngine, error) {
 //
 // FRESHNESS IS LOAD-BEARING FOR A CALLER OUTSIDE THIS PACKAGE. vector's
 // RecordMutator contract hands ownership of the returned bytes to the engine,
-// which stores them by reference in the arena. That is sound only because this
-// function allocates a new buffer per call (and createRecord allocates fresh).
-// Do not turn this into a pooled or reused buffer without changing that contract.
-func copyRecord(cur []byte) ([]byte, error) {
+// which stores them BY REFERENCE in the arena. That is sound only while the
+// bytes are freshly allocated, so vector must keep calling applyRecordBytes —
+// the nil-scratch path, where this function allocates per call and createRecord
+// allocates fresh. Do not hand the vector path a scratch buffer.
+//
+// The KV path may reuse one (applyRecordBytesInto, from handleOperate's pool)
+// for the opposite reason: tx.Put COPIES the record into the shard's page arena
+// (encodeEntry), so the store holds no reference once Put returns.
+// copyRecord copies cur into dst, reusing dst's array when it is already large
+// enough and allocating only when it is not. The +64 of slack is what a first
+// splice or row insert grows into without reallocating (see insertGap).
+//
+// dst is the CALLER's buffer: applyRecordBytesInto threads handleOperate's
+// pooled scratch down to here, so a warm pool makes the in-place apply path
+// allocate nothing at all. Passing nil is the allocating path every other
+// caller takes.
+func copyRecord(dst, cur []byte) ([]byte, error) {
 	if len(cur) > maxOperateRecordBytes {
 		return nil, wire.ErrOperateRecord
 	}
-	buf := make([]byte, len(cur), len(cur)+64)
-	copy(buf, cur)
-	return buf, nil
+	if cap(dst) < len(cur)+64 {
+		dst = make([]byte, 0, len(cur)+64)
+	}
+	return append(dst[:0], cur...), nil
 }
 
 // retsBefore evaluates the return specs against the pre-call record after a
@@ -268,7 +307,12 @@ func retsBefore(es engines, cur []byte, rets []wire.OperateRet) ([][]byte, error
 	// Re-opening the pre-call bytes reuses the same pooled engines: the
 	// working copy they were pointing at is discarded whole by a failed
 	// CHECK, so nothing in it is still needed.
-	buf, err := copyRecord(cur)
+	//
+	// It does NOT reuse the apply scratch, deliberately. This is the aborted
+	// path, not the hot one, and the values below alias the buffer they are
+	// read out of — sharing the scratch here would tie their lifetime to a
+	// buffer the handler is about to recycle, for no gain on any real call.
+	buf, err := copyRecord(nil, cur)
 	if err != nil {
 		return nil, err
 	}
