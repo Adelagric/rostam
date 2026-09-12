@@ -140,6 +140,15 @@ func (n *Node) AddShardOwner(shardID int) error {
 		return fmt.Errorf("cluster: add shard %d owner: %w", shardID, err)
 	}
 	n.shards[shardID] = store
+	// Re-arm the walk gate: a group that was removed earlier left it closed, and
+	// the observer must be able to backfill the new store's empty index.
+	n.reopenKVIndexWalks(shardID)
+	// Then put THIS store's scan-mode kv_query walks behind that same gate, so a
+	// scan in flight when the group is removed again is drained exactly like a
+	// backfill rather than reading pages Close has unmapped. Order matters only in
+	// that the gate must be open before a walk can register; installing the walker
+	// starts none. See installKVQueryScanGate.
+	n.installKVQueryScanGate(shardID, store)
 	return nil
 }
 
@@ -153,7 +162,43 @@ func (n *Node) RemoveShardOwner(shardID int) error {
 	n.shardMu.Lock()
 	s := n.shards[shardID]
 	n.shards[shardID] = nil
+	// FOLD THE GROUP'S KV INDEX COUNTERS INTO THE NODE TOTALS BEFORE ITS INDEX
+	// GOES AWAY. Stats().KVIndex.VerifyMisses and .ReconcileDrops are each the
+	// node counter plus the sum over HOSTED groups (kvIndexStats), because the
+	// query leaf runs in ops and the reconcile pass runs on the store's own
+	// goroutine — both can only reach the Set they hold. Dropping a group
+	// without folding would make those contracted uint64s DECREASE, which every
+	// scraper reads as a process restart and a reset of every other counter
+	// alongside them.
+	//
+	// Inside the lock, in the same critical section that takes the store out of
+	// n.shards, so no observer can see the group counted by neither. A query
+	// still in flight on this store can add a miss after the fold and lose it;
+	// that is bounded by the in-flight queries and never makes the total go
+	// backwards, which is the property being protected.
+	if s != nil {
+		if idx := s.KVIndex(); idx != nil {
+			n.kvIndexVerifyMisses.Add(idx.VerifyMisses())
+			n.kvIndexReconcileDrops.Add(idx.ReconcileDrops())
+		}
+	}
+	// SHUT THE GATE IN THE SAME CRITICAL SECTION THAT TAKES THE STORE OUT, so the
+	// gate's state and the shard slot's state are decided together. Shutting it
+	// after the unlock let a concurrent AddShardOwner — which installs the
+	// replacement store and re-arms the gate under this same lock — be undone by
+	// this removal: the new store would sit behind a gate nothing ever reopens,
+	// every scan on it answering ErrWalkAborted and the observer unable to
+	// backfill its index until the group was removed and re-added again. Done
+	// unconditionally, s==nil included, so a concurrent removal of a group this
+	// node had already dropped still shuts its gate.
+	n.closeKVIndexWalkGate(shardID)
 	n.shardMu.Unlock()
+	// Then WAIT, outside the lock, for any walk already inside this store. The
+	// walk aliases the store's live mmap, which Close unmaps; waiting first means
+	// the walk has returned before anything is unmapped, and the gate is already
+	// shut so a pass holding a stale store pointer cannot start a new one. The
+	// wait can block for a whole chunk, which is why it is not under shardMu.
+	n.waitKVIndexWalks(shardID)
 	if s == nil {
 		return nil
 	}

@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rostamlabs/rostam/cache"
@@ -37,6 +39,24 @@ type DirectConfig struct {
 
 	// Cache configures the cache layer (mmap knobs).
 	Cache CacheConfig
+
+	// KVIndexReconcileIntervalMs is how often this store reconciles ONE of its
+	// KV index definitions against the live cache. It follows the same
+	// convention as Cache.TTLSweepIntervalMs above: 0 keeps the default (60 s),
+	// negative disables the pass, positive sets the interval in milliseconds.
+	//
+	// BEWARE THE TWIN KNOB. shard.Config has a field of the same name and units
+	// whose zero means the OPPOSITE: there 0 DISABLES the pass (shard.Config is
+	// reached through shard.DefaultConfig, which fills the 60 000 in) and a
+	// negative value is rejected outright. So porting an Embedded config here by
+	// copying the field, and writing 0 to turn the pass off, silently gets you a
+	// 60 s ticker instead. Write -1 to disable on this side.
+	//
+	// Disabling it is safe and never changes an answer: every candidate is
+	// re-read and re-checked against the live value, so a posting the pass
+	// would have removed costs one wasted lookup and can never produce a wrong
+	// row. What it bounds is MEMORY. See ops/kvindex/reconcile.go.
+	KVIndexReconcileIntervalMs int
 
 	// Authenticator, when non-nil, gates every request on all transports. It is
 	// the unified RBAC authorizer (authz.Authenticator): it receives an
@@ -100,13 +120,28 @@ func NewDirect(cfg DirectConfig) (Store, error) {
 		_ = c.Close()
 		return nil, fmt.Errorf("rostam: open vector store: %w", err)
 	}
-	return &directStore{
+	// One KV record index per cache, exactly as shard.New does it — but simpler
+	// here, because a directStore has a SINGLE TxContext serving both its reads
+	// and its writes, so there is no second dispatcher to keep in step.
+	// NewKVIndexFor also installs Set.Drop as the cache's onRemove hook (deletes,
+	// evictions and TTL expiry unpost through it), and the rebuild covers a warm
+	// start off durable pages. Both happen before the store is reachable.
+	kvIdx := ops.NewKVIndexFor(c)
+	// The error cannot fire here: the cache is not reachable by anything that
+	// could close it until this constructor returns.
+	_ = ops.RebuildKVIndex(kvIdx, c)
+	d := &directStore{
 		cache:    c,
 		registry: cfg.Ops,
 		vectors:  vectorStore,
-		tx:       ops.NewTxContextWithVectors(c, vectorStore),
+		tx:       ops.NewTxContextWithIndex(c, vectorStore, kvIdx),
 		opMu:     make([]sync.Mutex, c.NumShards()),
-	}, nil
+	}
+	// The bounded reconcile pass. A Direct store builds no shard.Store, so it
+	// hosts its own copy of the ticker; Close stops and joins it before the
+	// cache is unmapped. See direct_kv_index_reconcile.go.
+	d.startKVIndexReconciler(directReconcileInterval(cfg.KVIndexReconcileIntervalMs))
+	return d, nil
 }
 
 // directStore implements Store on top of a bare cache.Cache. It does
@@ -122,9 +157,111 @@ type directStore struct {
 	//                         to different shards run concurrently — matching Embedded's
 	//                         independent per-shard Raft groups. Shardless ops lock all shards.
 	wasmRT *wasm.Runtime // lazily created on first RegisterWASM
+
+	// The KV index reconcile ticker's state. kvReconcileStop signals it,
+	// kvReconcileWg is how Close WAITS for it (the probe reads the cache, so it
+	// must be out before anything is unmapped), kvReconcileOnce makes the stop
+	// idempotent, and kvReconcileNext is the rotation cursor over the
+	// definitions. All nil/zero when the interval disables the pass.
+	kvReconcileStop chan struct{}
+	kvReconcileWg   sync.WaitGroup
+	kvReconcileOnce sync.Once
+	kvReconcileNext atomic.Uint64
+
+	// In-flight Call accounting, so Close cannot unmap the cache under a handler
+	// that is still reading it. shard.Store carries the identical fence for the
+	// identical reason (see shard.Store.drainCalls); a Direct store is the third
+	// host of the same hazard and had none.
+	//
+	// IT IS THE READ-ONLY OPS THAT NEED IT MOST. A read-write op serialises on
+	// opMu, but a read-only one deliberately takes no lock at all — the cache's
+	// own per-shard RWMutex gives each individual read its atomicity, which says
+	// nothing about a walk that spans many of them. A kv_query SCAN is the worst
+	// case: it walks the whole keyspace, aliasing pages d.cache.Close() unmaps,
+	// so a scan racing Close reads freed memory and takes the process down.
+	//
+	// EVERY CACHE-TOUCHING ENTRY POINT REGISTERS, not just Call. Get, GetInto,
+	// Put and Del reach the cache directly without going through the registry, so
+	// a fence on Call alone would leave four doors open — opMu makes Put and Del
+	// mutually exclusive with each other and with read-write ops, and none of
+	// that says anything about Close. The vector methods are not listed because
+	// they all funnel through Call.
+	callsMu       sync.Mutex
+	calls         int
+	callsDraining bool
+	callsIdle     chan struct{}
+}
+
+// ErrDirectClosed is returned by a Direct store's Call once Close has begun. Like
+// shard.ErrStoreClosed it is a REFUSAL rather than a failure of the op — the
+// store is going away — and it carries the same message so the transports that
+// recognise that refusal by text (ops.IsStoreClosedMessage) classify it the same
+// way if a Direct store is ever put behind one.
+var ErrDirectClosed = errors.New(ops.StoreClosedMsg)
+
+// directCallDrainTimeout bounds how long Close waits for in-flight Calls. Every
+// ordinary handler is microseconds; the bound exists for the pathological one (a
+// scan over a huge keyspace) so a stuck read cannot make a store unclosable.
+// Past it Close proceeds and logs, which restores exactly the pre-drain exposure
+// for that one case and only for it. Same value and same reasoning as
+// shard.closeCallDrainTimeout.
+const directCallDrainTimeout = 5 * time.Second
+
+// beginCall registers a Call as in-flight, or reports false when Close has begun
+// and the caller must not touch the cache.
+func (d *directStore) beginCall() bool {
+	d.callsMu.Lock()
+	defer d.callsMu.Unlock()
+	if d.callsDraining {
+		return false
+	}
+	d.calls++
+	return true
+}
+
+// endCall retires an in-flight Call and wakes a waiting drain when it was the
+// last one.
+func (d *directStore) endCall() {
+	d.callsMu.Lock()
+	defer d.callsMu.Unlock()
+	d.calls--
+	if d.callsDraining && d.calls == 0 && d.callsIdle != nil {
+		close(d.callsIdle)
+		d.callsIdle = nil
+	}
+}
+
+// drainCalls shuts the door on new Calls and waits, bounded, for the ones
+// already inside. Reports whether the store went quiet within the bound.
+// Idempotent: a second call finds the door shut and nothing in flight.
+func (d *directStore) drainCalls(timeout time.Duration) bool {
+	d.callsMu.Lock()
+	d.callsDraining = true
+	if d.calls == 0 {
+		d.callsMu.Unlock()
+		return true
+	}
+	if d.callsIdle == nil {
+		d.callsIdle = make(chan struct{})
+	}
+	idle := d.callsIdle
+	d.callsMu.Unlock()
+
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-idle:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 func (d *directStore) Get(_ context.Context, key []byte) ([]byte, error) {
+	if !d.beginCall() {
+		return nil, ErrDirectClosed
+	}
+	defer d.endCall()
 	raw, err := d.cache.Get(key)
 	if err != nil {
 		if errors.Is(err, cache.ErrNotFound) {
@@ -136,6 +273,10 @@ func (d *directStore) Get(_ context.Context, key []byte) ([]byte, error) {
 }
 
 func (d *directStore) GetInto(_ context.Context, key, dst []byte) ([]byte, error) {
+	if !d.beginCall() {
+		return nil, ErrDirectClosed
+	}
+	defer d.endCall()
 	raw, err := d.cache.GetInto(dst[:0], key)
 	if err != nil {
 		if errors.Is(err, cache.ErrNotFound) {
@@ -154,13 +295,34 @@ func (d *directStore) GetInto(_ context.Context, key, dst []byte) ([]byte, error
 // Raft FSM as incr and can never interleave. Get stays lock-free like read-only
 // ops (the cache shard RWMutex gives each read its own atomicity).
 func (d *directStore) Put(_ context.Context, key, value []byte, ttl time.Duration) error {
+	if !d.beginCall() {
+		return ErrDirectClosed
+	}
+	defer d.endCall()
 	mu := &d.opMu[d.cache.ShardIndex(key)]
 	mu.Lock()
 	defer mu.Unlock()
-	return d.cache.Put(key, value, ttl)
+	if err := d.cache.Put(key, value, ttl); err != nil {
+		return err
+	}
+	// This is the ONE write that does not go through an op handler, so it has to
+	// maintain the record index itself — otherwise a Put here would leave the
+	// posting describing the PREVIOUS value and a query for the new one would
+	// miss the key, which is the one failure mode the index may not have. AFTER
+	// the Put, for the same reason handlers do it after (an evicting Put can
+	// fire onRemove for the key being written). Del needs no counterpart: it
+	// removes a live slot, so onRemove → Set.Drop already fires.
+	if idx := d.tx.KVIndex(); idx != nil {
+		idx.Reindex(key, value)
+	}
+	return nil
 }
 
 func (d *directStore) Del(_ context.Context, key []byte) (bool, error) {
+	if !d.beginCall() {
+		return false, ErrDirectClosed
+	}
+	defer d.endCall()
 	mu := &d.opMu[d.cache.ShardIndex(key)]
 	mu.Lock()
 	defer mu.Unlock()
@@ -206,6 +368,14 @@ func (d *directStore) CallAppend(_ context.Context, op string, args, dst []byte)
 }
 
 func (d *directStore) callWith(op string, args, dst []byte, appendMode bool) ([]byte, error) {
+	// Registered as in-flight BEFORE anything reads the cache, and retired only
+	// once the handler has returned — so Close cannot unmap under a handler still
+	// holding page-backed bytes. Both Call and CallAppend funnel through here, so
+	// one registration covers both entry points. See the calls fields.
+	if !d.beginCall() {
+		return nil, ErrDirectClosed
+	}
+	defer d.endCall()
 	handler, kind, ke, crossShard, ok := d.registry.LookupEntry(op)
 	if !ok {
 		return nil, fmt.Errorf("rostam: op %q not registered", op)
@@ -273,6 +443,19 @@ func (d *directStore) LeaderAddr(_ []byte) string { return "" }
 
 func (d *directStore) Close() error {
 	var errs []error
+	// The KV index reconcile ticker probes the cache, so it has to be out before
+	// d.cache.Close unmaps anything. Stopped FIRST, and joined: a signal alone
+	// would leave a tick already inside cache.Get racing the unmap.
+	d.stopKVIndexReconciler()
+	// Then the CALLERS' reads. A read-only op takes no op lock by design, so a
+	// kv_query scan can still be walking the cache right now; d.cache.Close()
+	// unmaps the pages it is reading. Draining here means nothing is inside the
+	// cache past this point, and every later Call, Get, GetInto, Put or Del is
+	// refused rather than admitted into a store that is being torn down.
+	if !d.drainCalls(directCallDrainTimeout) {
+		slog.Warn("direct store closing with calls still in flight; proceeding after the drain bound",
+			"component", "direct", "waited", directCallDrainTimeout)
+	}
 	if d.wasmRT != nil {
 		if err := d.wasmRT.Close(); err != nil {
 			errs = append(errs, err)

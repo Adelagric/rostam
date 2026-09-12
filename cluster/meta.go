@@ -13,6 +13,7 @@ import (
 	hraft "github.com/hashicorp/raft"
 
 	"github.com/rostamlabs/rostam/raft/logstore"
+	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
 // metaGroupID is the mux group ID reserved for the meta-Raft transport.
@@ -379,6 +380,48 @@ func (m *MetaRaft) ApplySetCatalogEntry(collection string, partitions, generatio
 	if resp := f.Response(); resp != nil {
 		if respErr, ok := resp.(error); ok {
 			return fmt.Errorf("cluster: meta FSM SetCatalogEntry: %w", respErr)
+		}
+	}
+	return nil
+}
+
+// ApplySetKVIndex commits one KV index definition to the meta-Raft catalog.
+// Mirrors ApplySetCatalogEntry: it refuses when this node is not the meta leader
+// (the caller forwards to the leader; see Node.SetKVIndex) and surfaces an
+// FSM-returned error — the definition cap and the shape check both live in the
+// FSM, so a refusal there has to reach the client rather than being swallowed as
+// a successful commit.
+//
+// d.Enabled == false is a DELETE of the named definition, not a stored "off"
+// flag; the FSM apply is where that is decided.
+//
+// THE ADMISSION CHECK IS THE FULL ONE, not wire.KVIndexDef.Validate. This is the
+// last place a definition can be refused while refusing it still costs the caller
+// only an error: past the Apply it is committed cluster-wide, and a definition
+// that parses nowhere then fails at install on every node while making every
+// query naming it look retryable. See validateKVIndexDef, which states why the
+// parse cannot live in the FSM instead.
+func (m *MetaRaft) ApplySetKVIndex(d wire.KVIndexDef, timeout time.Duration) error {
+	if err := validateKVIndexDef(d); err != nil {
+		return fmt.Errorf("cluster: SetKVIndex: %w", err)
+	}
+	if m.Raft.State() != hraft.Leader {
+		return hraft.ErrNotLeader
+	}
+	entry, err := encodeLogEntry(LogEntry{
+		Op:      OpSetKVIndex,
+		KVIndex: d,
+	})
+	if err != nil {
+		return fmt.Errorf("cluster: meta encode SetKVIndex: %w", err)
+	}
+	f := m.Raft.Apply(entry, timeout)
+	if err := f.Error(); err != nil {
+		return fmt.Errorf("cluster: meta apply SetKVIndex: %w", err)
+	}
+	if resp := f.Response(); resp != nil {
+		if respErr, ok := resp.(error); ok {
+			return fmt.Errorf("cluster: meta FSM SetKVIndex: %w", respErr)
 		}
 	}
 	return nil

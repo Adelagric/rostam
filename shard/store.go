@@ -14,6 +14,7 @@ import (
 
 	"github.com/rostamlabs/rostam/cache"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/raft"
 	"github.com/rostamlabs/rostam/shard/pbisr"
 	"github.com/rostamlabs/rostam/vector"
@@ -35,6 +36,11 @@ type Store struct {
 	raft     replicator // the active data-plane engine (Raft by default; see replicator.go)
 	fsm      *fsm
 	tx       *ops.TxContext // reused across read-only Call paths; same caching rationale as fsm.tx
+
+	// kvIdx is THE KV record index of this shard's cache: one Set per cache,
+	// created in New, maintained by fsm.tx on the write path and read through
+	// tx on the read-only path. Both TxContexts hold this same pointer.
+	kvIdx *kvindex.Set
 
 	// readindex coalesces concurrent Linearizable-read barriers on THIS Store into
 	// one shared VerifyLeader+Barrier RTT, while guaranteeing no reader is served a
@@ -64,6 +70,111 @@ type Store struct {
 	// final, exact stamp is both possible (the mapping still exists) and complete
 	// (no further apply can advance the frontier past it).
 	pbFrontier *pbFrontierStamper
+
+	// calls counts the Call invocations currently INSIDE this store;
+	// callsDraining and callsIdle are how Close waits for them.
+	//
+	// A HANDLER ALIASES THE LIVE MMAP. cache.Get hands a handler bytes straight
+	// out of a mapped page and cache.Close unmaps it, so a Call still running
+	// when Close reaches the unmap does not read a stale value — it reads
+	// unmapped memory and the process dies.
+	//
+	// That window is not theoretical. A cluster read fanned out to every shard
+	// group ABANDONS any leg whose per-group timeout expires
+	// (cluster.forEachGroup), so "a Call is still running after its caller gave
+	// up on it" is the designed behaviour of the layer above, not an anomaly;
+	// RemoveShardOwner or Node.Close arriving in that window is all it takes.
+	//
+	// The fix is the drain the cache already uses for its own goroutines and the
+	// cluster layer uses for index walks, one level lower: Close stops NEW calls
+	// and waits for the ones already inside before anything is unmapped. Bounded,
+	// because a wait with no end is its own outage — a store whose handler is
+	// genuinely stuck must still be closable, so past the bound Close proceeds
+	// and says so.
+	callsMu       sync.Mutex
+	calls         int
+	callsDraining bool
+	callsIdle     chan struct{} // non-nil only while a drain is waiting
+
+	// The KV index reconcile ticker's state. kvReconcileStop signals it,
+	// kvReconcileWg is how Close WAITS for it (the probe reads the cache, so it
+	// must be out before anything is unmapped), kvReconcileOnce makes the stop
+	// idempotent — Close is not documented as single-shot and a second close(2)
+	// would panic — and kvReconcileNext is the rotation cursor over the
+	// definitions. All nil/zero when the interval disables the pass. See
+	// kv_index_reconcile.go for why the ticker lives here and not on the node.
+	kvReconcileStop chan struct{}
+	kvReconcileWg   sync.WaitGroup
+	kvReconcileOnce sync.Once
+	kvReconcileNext atomic.Uint64
+}
+
+// ErrStoreClosed is returned by Call once Close has begun. It is a REFUSAL, not
+// a failure of the op: this store is going away, and in a cluster the caller
+// should reach the group's other replicas — which is why every transport
+// classifies it retryable (503 / Unavailable) rather than as a fault.
+//
+// Its text comes from ops.StoreClosedMsg because httpapi and grpcapi cannot
+// import this package and must recognise the refusal by message
+// (ops.IsStoreClosedMessage). Sharing the constant makes a rewording a
+// compile-time concern instead of a silent regression to "internal error".
+var ErrStoreClosed = errors.New(ops.StoreClosedMsg)
+
+// closeCallDrainTimeout bounds how long Close waits for in-flight Calls. Every
+// ordinary handler is microseconds; the bound is there for the pathological one
+// (a scan over a huge keyspace, a handler wedged on something else) so a stuck
+// read cannot make a node unclosable. Past it Close proceeds and logs, which
+// restores exactly the pre-drain exposure — for that one case, and only for it.
+const closeCallDrainTimeout = 5 * time.Second
+
+// beginCall registers a Call as in-flight, or reports false when the store is
+// closing and the caller must not enter.
+func (s *Store) beginCall() bool {
+	s.callsMu.Lock()
+	defer s.callsMu.Unlock()
+	if s.callsDraining {
+		return false
+	}
+	s.calls++
+	return true
+}
+
+// endCall retires an in-flight Call and wakes a waiting drain when it was the
+// last one.
+func (s *Store) endCall() {
+	s.callsMu.Lock()
+	defer s.callsMu.Unlock()
+	s.calls--
+	if s.callsDraining && s.calls == 0 && s.callsIdle != nil {
+		close(s.callsIdle)
+		s.callsIdle = nil
+	}
+}
+
+// drainCalls shuts the door on new Calls and waits, bounded, for the ones
+// already inside. It reports whether the store went quiet within the bound.
+// Idempotent: a second call finds the door shut and nothing in flight.
+func (s *Store) drainCalls(timeout time.Duration) bool {
+	s.callsMu.Lock()
+	s.callsDraining = true
+	if s.calls == 0 {
+		s.callsMu.Unlock()
+		return true
+	}
+	if s.callsIdle == nil {
+		s.callsIdle = make(chan struct{})
+	}
+	idle := s.callsIdle
+	s.callsMu.Unlock()
+
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-idle:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 // SetLeaderFrontierFn installs the follower-side leader-frontier hook used by
@@ -203,13 +314,38 @@ func New(cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("shard: cache: %w", err)
 	}
 
+	// ############### ONE KV RECORD INDEX PER CACHE, CREATED HERE #############
+	//
+	// Created BEFORE the FSM and before the replication engine that drives it,
+	// then SHARED: the same pointer goes to newFSM (which maintains it from every
+	// write apply) and to storeTx (from which every read-only op is served — see
+	// Call). Two Sets would compile and be silently wrong: the write path would
+	// fill one while reads answered from the other, so every kv_query would come
+	// back empty.
+	//
+	// NewKVIndexFor also registers Set.Drop as the cache's SINGLE onRemove hook,
+	// which is how deletes, evictions and TTL expiry unpost keys. Doing it here,
+	// before raft.NewNode starts the apply goroutine, means no write can land
+	// before the hook is in place; the goroutine-start happens-before edge
+	// publishes both without a race.
+	kvIdx := ops.NewKVIndexFor(c)
+	// Warm start: a durable cache comes back holding content (rebuildIndexFromPages)
+	// that the index has never seen, because the index is re-derived rather than
+	// restored — it is in no snapshot, no WAL and no log. A no-op today, since no
+	// definition is installed this early and a rebuild with none walks nothing;
+	// kept because this is the one point where the cache is warm and the index is
+	// empty.
+	// The error cannot fire here: the cache is not reachable by anything that
+	// could close it until this constructor returns.
+	_ = ops.RebuildKVIndex(kvIdx, c)
+
 	vectorStore, err := vector.OpenCollectionStorePersistent(cfg.DataDir, cfg.PersistentVectors)
 	if err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("shard: open vector store: %w", err)
 	}
 
-	fsmImpl := newFSM(c, cfg.Ops, cfg.Cache.Durable, vectorStore)
+	fsmImpl := newFSM(c, cfg.Ops, cfg.Cache.Durable, vectorStore, kvIdx)
 	fsmImpl.wasmSnapshot = cfg.WASMSnapshot
 	fsmImpl.wasmRestore = cfg.WASMRestore
 	fsmImpl.onApplyRetry = cfg.OnApplyRetry
@@ -324,9 +460,12 @@ func New(cfg Config) (*Store, error) {
 		rep = rn
 	}
 
-	storeTx := ops.NewTxContextWithVectors(c, vectorStore)
+	// The SAME kvIdx the FSM got: read-only ops (kv_query among them) run
+	// handler(s.tx, args), so this is the dispatcher that must see the postings
+	// the write path maintains.
+	storeTx := ops.NewTxContextWithIndex(c, vectorStore, kvIdx)
 	storeTx.SetShardIndex(cfg.ShardIndex)
-	return &Store{
+	s := &Store{
 		cfg:        cfg,
 		cache:      c,
 		registry:   cfg.Ops,
@@ -334,10 +473,42 @@ func New(cfg Config) (*Store, error) {
 		raft:       rep,
 		fsm:        fsmImpl,
 		tx:         storeTx,
+		kvIdx:      kvIdx,
 		stop:       stop,
 		pbFrontier: pbFrontier,
-	}, nil
+	}
+	// The bounded reconcile pass. Started last, on the fully built Store, so the
+	// goroutine cannot observe a half-initialised one; Close stops and joins it
+	// before the cache is unmapped.
+	s.startKVIndexReconciler()
+	return s, nil
 }
+
+// KVIndex returns this shard's KV record index — the single Set the FSM
+// maintains and read-only ops are served from. Never nil for a Store built by
+// New. The activation observer installs definitions into it and backfills them.
+func (s *Store) KVIndex() *kvindex.Set { return s.kvIdx }
+
+// CacheWalker returns this shard's chunked full-keyspace walk, in the shape
+// kvindex.Rebuild and kvindex.Backfill take. It releases each cache shard's
+// read lock every few thousand slots, so a backfill over a large keyspace does
+// not block writers for the length of a whole shard's walk.
+//
+// THE WALK ALIASES A LIVE MMAP, so the caller owns the lifetime rule: this store
+// must not be closed while a walk is running. cluster.Node registers each walk
+// and drains it before removing a shard; see cluster.Node.beginKVIndexWalk.
+func (s *Store) CacheWalker() kvindex.Walker { return ops.CacheWalker(s.cache) }
+
+// SetKVWalker installs the walk a scan-mode kv_query on this store uses, on the
+// READ-ONLY dispatcher that serves it. It is the seam the cluster layer uses to
+// put a scan walk behind the same gate a backfill walk goes through, so both are
+// drained before this store is closed — without it a long scan racing
+// RemoveShardOwner reads an unmapped page. See ops.TxContext.SetWalker for why
+// the gate cannot live in ops.
+//
+// Only the read-only dispatcher: kv_query is OpReadOnly and never applied, so
+// the FSM's TxContext never walks.
+func (s *Store) SetKVWalker(w kvindex.Walker) { s.tx.SetWalker(w) }
 
 // raftReplicatedFn builds the FSM's isReplicated gate over a LIVE Raft group-size
 // source (raft.Node.NumServers). It FAILS CLOSED: the gate reports replicated
@@ -373,8 +544,22 @@ func (s *Store) Close() error {
 	// wait that has no end. sync.Once because Close is not documented as
 	// single-shot and a second close(3) would panic.
 	s.stopOnce.Do(func() { close(s.stop) })
+	// The KV index reconcile ticker probes the cache, so it has to be out before
+	// cache.Close unmaps anything. Stopped FIRST, and joined: a signal alone
+	// would leave a tick already inside cache.Get racing the unmap. Same hazard,
+	// same shape as the Call drain below and the cluster's index-walk gate.
+	s.stopKVIndexReconciler()
 	if err := s.raft.Shutdown(); err != nil {
 		errs = append(errs, err)
+	}
+	// THEN drain the ops still inside this store, before anything is unmapped.
+	// After the shutdown above, so a write parked in raft.Apply has already been
+	// failed rather than waited on: what is left to wait for is reads, which are
+	// microseconds unless one is walking the whole keyspace. New Calls are
+	// refused from here on with ErrStoreClosed. See the calls field.
+	if !s.drainCalls(closeCallDrainTimeout) {
+		slog.Warn("shard: closing with calls still in flight; the cache is about to be unmapped under them",
+			"component", "shard", "shard", s.cfg.ShardIndex, "waited", closeCallDrainTimeout)
 	}
 	// Replication is down, so the applied frontier can no longer move: stamp it
 	// exactly, while the cache mapping is still live. A clean shutdown therefore
@@ -663,6 +848,13 @@ func (s *Store) serveBoundedStaleness(name string, args []byte) error {
 // Call dispatches a registered op by name. Read-only ops execute directly
 // against the cache; read-write ops go through Raft.
 func (s *Store) Call(name string, args []byte) ([]byte, error) {
+	// Registered as in-flight BEFORE anything reads the cache, and retired only
+	// when the handler has returned — so Close cannot unmap under a handler that
+	// is still holding page-backed bytes. See the calls field.
+	if !s.beginCall() {
+		return nil, ErrStoreClosed
+	}
+	defer s.endCall()
 	handler, kind, _, ok := s.registry.Lookup(name)
 	if !ok {
 		return nil, ErrOpNotRegistered

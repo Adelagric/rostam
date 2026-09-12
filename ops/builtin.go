@@ -88,6 +88,9 @@ var builtinHandlers = map[string]Handler{
 	// broadcasts it to every shard group; each group applies it here against its own
 	// cache. See handleFlush.
 	"flush": handleFlush,
+	// kv_query answers a filtered read over the KV keyspace, narrowed by a
+	// record index when one covers the filter. See handleKVQuery.
+	"kv_query": handleKVQuery,
 	// put_batch packs N puts into one Raft log entry (one fsync / round-trip /
 	// apply for the whole batch). It routes by its FIRST key, so every key in a
 	// batch must hash to the same shard — the cluster fan-out (Node.PutBatch)
@@ -277,9 +280,18 @@ func handlePut(tx *TxContext, args []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return nil, tx.Put(key, val, ttl)
+	if err := tx.Put(key, val, ttl); err != nil {
+		return nil, err
+	}
+	tx.reindexKV(key, val)
+	return nil, nil
 }
 
+// handleDel removes the key. It reindexes NOTHING on purpose: tx.Del removes a
+// live index slot, which fires the cache's onRemove hook, which is Set.Drop —
+// so the postings are already gone by the time Del returns. The same hook
+// covers getdel, compare-and-del, operate's delete branch, evictions and TTL
+// expiry; a handler-side drop would be a second, racier copy of it.
 func handleDel(tx *TxContext, args []byte) ([]byte, error) {
 	key, err := wire.DecodeKeyArgs(args)
 	if err != nil {
@@ -303,10 +315,36 @@ func handleDel(tx *TxContext, args []byte) ([]byte, error) {
 // whole keyspace. Flush is idempotent, so a Raft replay or a broadcast retry is
 // safe. No apply-stamping: cache.Flush captures each replica's local writeSeq floor,
 // so replicas converge on an empty keyspace with no coordinated clock.
+//
+// The index: Flush is O(shards), so it fires NO per-key onRemove and the record
+// index would otherwise keep every posting it had. Set.Reset is the complete
+// index action for a flush — it drops every posting AND marks every definition
+// ready, because an empty posting set over an empty keyspace is exact for every
+// definition. Nothing re-installs and nothing re-backfills after a flush.
+//
+// It runs only on SUCCESS, and the asymmetry is deliberate. A failed Flush may
+// have emptied some shards and not others; keeping the postings then leaves
+// hints for keys that are gone (harmless — every candidate is re-read and
+// re-checked against the live value), whereas resetting would publish an empty
+// index as EXACT over a keyspace that still has keys in it, and a query would
+// answer a proper subset of the truth. Stale is survivable, missing is not.
 func handleFlush(tx *TxContext, _ []byte) ([]byte, error) {
-	return nil, tx.Cache().Flush()
+	if err := tx.Cache().Flush(); err != nil {
+		return nil, err
+	}
+	if idx := tx.KVIndex(); idx != nil {
+		idx.Reset()
+	}
+	return nil, nil
 }
 
+// handleExpire replaces the key's deadline and nothing else, so the posting's
+// CONTENT does not change. It still has to be re-posted, because the rewrite
+// goes through the cache's put body and can evict the page framing the key's
+// own copy — dropping every posting for a key that stays live. That re-post
+// lives in TxContext.Expire, the seam this handler and caex both go through,
+// so neither calls reindexKV itself. persist does its own (it writes through
+// PutAbs). The eventual expiry fires onRemove → Set.Drop as always.
 func handleExpire(tx *TxContext, args []byte) ([]byte, error) {
 	key, ttl, err := wire.DecodeExpireArgs(args)
 	if err != nil {
@@ -338,6 +376,7 @@ func handleIncr(tx *TxContext, args []byte) ([]byte, error) {
 	if err := tx.Put(key, buf, 0); err != nil {
 		return nil, err
 	}
+	tx.reindexKV(key, buf)
 	return wire.EncodeIncrResult(next), nil
 }
 
@@ -355,6 +394,9 @@ func handleSetNX(tx *TxContext, args []byte) ([]byte, error) {
 		if err := tx.Put(key, val, ttl); err != nil {
 			return nil, err
 		}
+		// Only the STORED branch reindexes. A refused set_nx changed no stored
+		// bytes, so the existing posting is still the truth about this key.
+		tx.reindexKV(key, val)
 		return []byte{1}, nil
 	case err != nil:
 		return nil, err
@@ -388,6 +430,8 @@ func handleCAS(tx *TxContext, args []byte) ([]byte, error) {
 	if err := tx.Put(key, val, ttl); err != nil {
 		return nil, err
 	}
+	// Only reached on a successful swap; every mismatch returned above.
+	tx.reindexKV(key, val)
 	return []byte{1}, nil
 }
 
@@ -487,6 +531,7 @@ func handleGetSet(tx *TxContext, args []byte) ([]byte, error) {
 	if err := tx.Put(key, val, ttl); err != nil {
 		return nil, err
 	}
+	tx.reindexKV(key, val)
 	return wire.EncodeGetDelResult(oldCopy, found), nil
 }
 
@@ -516,6 +561,11 @@ func handlePersist(tx *TxContext, args []byte) ([]byte, error) {
 	if err := tx.PutAbs(key, buf, 0); err != nil {
 		return nil, err
 	}
+	// The SAME bytes, but still a write through the cache's put body — which
+	// can evict the page framing this key's own current copy and drop every
+	// posting for it mid-write, leaving a live key unfindable. Re-post after
+	// the write returns. See TxContext.Expire for the full argument.
+	tx.reindexKV(key, buf)
 	return []byte{1}, nil
 }
 
@@ -591,6 +641,8 @@ func handleIncrEx(tx *TxContext, args []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
+	// Both branches store new bytes (the counter moved), so both reindex.
+	tx.reindexKV(key, buf)
 	return wire.EncodeIncrResult(next), nil
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/rostamlabs/rostam/authz"
 	"github.com/rostamlabs/rostam/dashboard"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/ops/kvindex"
 	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/vector"
 )
@@ -163,6 +164,20 @@ func Handler(disp Dispatcher, opts Options) http.Handler {
 	// Wipe the whole KV keyspace. A fixed, keyless route — no {key} — so it never
 	// collides with the /v1/kv/{key} patterns above (those are GET/PUT/DELETE only).
 	mux.HandleFunc("POST /v1/kv/flush", a.kvFlush)
+	// KV record search. Fixed, keyless routes under /v1/kv/, like flush.
+	//
+	// A NOTE ON SHADOWING, and it is narrower than it looks. "/v1/kv/{key}"
+	// matches exactly three path segments, so "DELETE /v1/kv/indexes/{name}"
+	// (four) never competes with it at all. Only "GET /v1/kv/indexes" collides,
+	// and ServeMux prefers the literal over the wildcard: a KV key literally
+	// named "indexes" is no longer READABLE over REST, while PUT and DELETE on
+	// it still reach the {key} route. The same carve-out /v1/kv/flush already
+	// made, and the remedy is the same — address such a key over the binary or
+	// gRPC transport.
+	mux.HandleFunc("POST /v1/kv/query", a.kvQuery)
+	mux.HandleFunc("POST /v1/kv/indexes", a.kvIndexCreate)
+	mux.HandleFunc("GET /v1/kv/indexes", a.kvIndexList)
+	mux.HandleFunc("DELETE /v1/kv/indexes/{name}", a.kvIndexDrop)
 	mux.HandleFunc("POST /v1/collections", a.createCollection)
 	mux.HandleFunc("DELETE /v1/collections/{name}", a.dropCollection)
 	mux.HandleFunc("POST /v1/collections/{name}/points", a.putPoint)
@@ -501,6 +516,78 @@ func writeInternalError(w http.ResponseWriter, ctx string, err error) {
 // leader becomes 503; everything else is 500.
 func statusForError(err error) int {
 	switch {
+	// THE kv_query FAMILY IS CLASSIFIED FIRST, and the position is load-bearing.
+	// Several arms below match by SUBSTRING ("rate limited", "collection full",
+	// "not leader"), and a kv_query filter refusal quotes the caller's own FIELD
+	// NAME verbatim into its message — so with these arms further down, a client
+	// naming a filter field "rate limited" turned its own permanent 400 into a
+	// 429 that clients back off and retry. Reproduced before this move; pinned by
+	// TestHTTPKVQueryFilterTextCannotSteerTheStatus. Matching by IDENTITY first
+	// is strictly more precise than any heuristic below it, so nothing else
+	// loses.
+	//
+	// The set is kept in sync with server.clientFacingErr, which classifies the
+	// same errors for the TCP edge — and, crucially, for the peer-to-peer
+	// __kv_query_shard__ leg, where redaction would leave the coordinator
+	// nothing to classify (see the comment there) — and with grpcapi.grpcError,
+	// which maps them onto InvalidArgument/NotFound/Unavailable.
+	//
+	// PERMANENT ones are 400: the filter, the missing scan consent, the scan
+	// budget and a malformed frame are all facts about the query the caller
+	// sent. ops.ErrKVIndexUnavailable is the odd one out — it says this
+	// deployment has no KV index at all — but it is equally not something to
+	// retry, and 400 tells the caller to stop rather than to wait.
+	//
+	// kvindex.ErrNoSuchIndex is the one that is NOT a 400 but a 404: the caller
+	// named a definition that does not exist, which is what 404 says, and it
+	// tells a client library to create the index rather than to fix its filter.
+	// It is matched by SENTINEL only — the leaf's message shape carries a
+	// caller-chosen index name, and rewriting a message into a 404 is not worth
+	// a matcher when a coordinator that finds the name in the meta catalog has
+	// already rewritten it to the retryable ErrIndexBuilding below.
+	case errors.Is(err, kvindex.ErrNoSuchIndex):
+		return http.StatusNotFound
+	case errors.Is(err, ops.ErrKVQueryFilter),
+		errors.Is(err, ops.ErrKVQueryScanRequired),
+		errors.Is(err, ops.ErrKVQueryScanBudget),
+		errors.Is(err, ops.ErrKVIndexUnavailable),
+		// The coordinator built a continuation it cannot represent, and the
+		// candidate/filter budgets. All are facts about what the caller asked
+		// for, and each message carries the arithmetic the caller acts on.
+		errors.Is(err, ops.ErrKVQueryCursorCap),
+		errors.Is(err, kvindex.ErrCandidateBudget),
+		errors.Is(err, wire.ErrKVFilterBudget),
+		errors.Is(err, wire.ErrKVQueryArgs),
+		errors.Is(err, wire.ErrKVQueryResult),
+		errors.Is(err, wire.ErrKVQueryArgsTruncated),
+		// wire.ErrKVIndexDef: POST/DELETE /v1/kv/indexes refused the definition.
+		// This edge validates the SHAPE locally before dispatch, so what arrives
+		// here is the deeper refusal the cluster's admission check makes — a
+		// payload path this build cannot parse. Still a 400: only a different
+		// definition can change it.
+		errors.Is(err, wire.ErrKVIndexDef):
+		return http.StatusBadRequest
+	// RETRYABLE ones are 503, the bucket this transport already uses for every
+	// other "come back in a moment": the index exists but this group has not
+	// finished installing or backfilling it, the definition moved under the
+	// query, or the shard is being removed from the node mid-scan.
+	case errors.Is(err, kvindex.ErrIndexBuilding),
+		errors.Is(err, kvindex.ErrIndexChanged),
+		errors.Is(err, ops.ErrKVQueryUnavailable),
+		// shard.ErrStoreClosed: the store refused the Call because it is
+		// draining for close. A REFUSAL, not a fault — the op never ran, and in
+		// a cluster the group's other replicas can serve it — so it belongs in
+		// the same retryable bucket the reshard refusal further down uses. This package
+		// cannot import shard (the layering wall server.clientFacingErr
+		// documents), so it is matched by ops.IsStoreClosedMessage: it peels the
+		// known wrappers by anchored cut and then requires what REMAINS to EQUAL
+		// the shared spelling shard.ErrStoreClosed is DECLARED from. Exact form,
+		// not a suffix or a substring — this arm makes an error RETRYABLE, and
+		// caller text is quoted verbatim into other refusals in this family, so
+		// anything short of equality is a way for a client to make its own
+		// permanent error retry forever.
+		ops.IsStoreClosedMessage(err.Error()):
+		return http.StatusServiceUnavailable
 	case errors.Is(err, vector.ErrDimMismatch),
 		// A payload carrying a record value above the storage cap: 400, not 500.
 		// The cap is the snapshot/WAL codec's, so accepting the write would mean

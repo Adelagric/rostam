@@ -227,17 +227,71 @@ var adminOps = map[string]struct{}{
 	// pins the shard-scoped leg at admin so it can never be silently demoted to
 	// write and handed to any write:* key.
 	"__flush_shard__": {},
+	// The KV record-index catalog ops (cluster/kv_index_admin.go). Enumerated for
+	// the reason spelled out above __flush_shard__: none of the three is in the
+	// ops registry today, so all three would be admin by actionFor's
+	// deny-by-default fallthrough — by coincidence, not by decision, and one
+	// natural refactor (registering them so they dispatch through the registry
+	// rather than through n.adminOps) removes it silently.
+	//
+	// __kv_index_set__ CREATES AND DROPS INDEXES CLUSTER-WIDE through the meta
+	// log. Dropping one is what makes it admin rather than write: every query
+	// naming that index starts failing, and on a large keyspace re-creating it
+	// costs a full-cache walk on every node. A schema-shaped operation, not a
+	// data-shaped one.
+	//
+	// __kv_index_ready__ is the internal per-group readiness leaf. Its only
+	// legitimate caller is a peer, which carries the internal service token and is
+	// granted before this map is consulted, so admin costs the gather nothing.
+	//
+	// __kv_index_list__ is NOT here: it is a READ of the catalog and lives in
+	// readOps below. See the note there for why that demotion is safe.
+	"__kv_index_set__":   {},
+	"__kv_index_ready__": {},
+	// The INTERNAL shard-scoped leg of the kv_query fan-out
+	// (cluster/kv_query_broadcast.go), enumerated for the same reason as the three
+	// above. `kv_query` ITSELF is an ordinary OpReadOnly and is classified as a
+	// read from the registry; the WRAPPER is pinned at admin so it can never be
+	// demoted to read and become a way for a read:* key to address ONE shard group
+	// directly — bypassing the coordinator, which is the only thing that makes a
+	// page a complete answer rather than one group's slice of it.
+	"__kv_query_shard__": {},
 }
 
 // readOps is the small set of cluster-introspection ops that are explicitly
-// "read": __ping__ (liveness), __topology__ (cluster map) and __collections__
-// (the dashboard's dense-collection list). All are also registered OpReadOnly,
-// but enumerating them keeps the classification explicit and independent of
-// registration order.
+// "read": __ping__ (liveness), __topology__ (cluster map), __collections__ (the
+// dashboard's dense-collection list) and __kv_index_list__ (the KV index
+// catalog). All but the last are also registered OpReadOnly; enumerating them
+// keeps the classification explicit and independent of registration order, and
+// __kv_index_list__ is in NO registry at all (it is intercepted by cluster.Node
+// before routing), so without this entry it would fall to actionFor's
+// deny-by-default "admin".
+//
+// WHY __kv_index_list__ IS A READ while __kv_index_set__ stays admin. Listing
+// returns definitions and readiness bits — names, key prefixes, payload paths
+// and a bool — which is metadata about the caller's own keyspace and no more
+// privileged than __topology__. Its sibling CREATES AND DROPS indexes through
+// the meta log: a drop makes every query naming that index start failing at
+// once, and re-creating it costs a full cache walk on every node. That is a
+// schema-shaped operation, so it keeps the admin bar. The split is what lets an
+// operator hand a read-scoped key enough to poll "is my index ready yet"
+// without handing it the ability to delete one. Both halves are pinned by
+// TestKVIndexListIsARead and TestActionForKVIndexOpsIsAdmin, and the RBAC
+// consequence by TestRBACKVIndexListAllowsReadScope.
+//
+// The readiness gather this exposes is BOUNDED, which is the precondition for
+// the demotion: the list op takes no arguments at all
+// (cluster.handleListKVIndexes rejects a non-empty payload), so nothing a
+// caller sends sizes any allocation; the names come from the meta catalog and
+// are capped at wire.KVIndexMaxDefs (64); every per-group leg runs under
+// cluster.kvIndexReadyGroupTimeout with the bound enforced OUTSIDE the leg, so
+// one silent group costs one timeout rather than the call; and the legs run
+// concurrently, so the cost is the slowest group's latency, not the sum.
 var readOps = map[string]struct{}{
-	"__ping__":        {},
-	"__topology__":    {},
-	"__collections__": {},
+	"__ping__":          {},
+	"__topology__":      {},
+	"__collections__":   {},
+	"__kv_index_list__": {},
 }
 
 // actionFor returns the required action ("read"|"write"|"admin") for op.

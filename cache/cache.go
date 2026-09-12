@@ -20,6 +20,14 @@ type Cache struct {
 	closed  atomic.Bool
 	closeCh chan struct{}
 	wg      sync.WaitGroup
+
+	// onRemove is the derived-secondary-index removal hook installed by
+	// SetOnRemove; nil by default. See cache/onremove.go for the full contract
+	// (fires under the shard write lock, key aliases the page, hint channel only).
+	// Every shard holds a POINTER to this one atomic, so installing or clearing the
+	// hook is a single store observed by all of them, and a shard never needs a
+	// back-pointer to the Cache.
+	onRemove atomic.Pointer[func([]byte)]
 }
 
 // New constructs a Cache with the given configuration.
@@ -38,7 +46,7 @@ func New(cfg Config) (*Cache, error) {
 		if cfg.DataDir != "" {
 			sd = filepath.Join(cfg.DataDir, fmt.Sprintf("shard-%04d", i))
 		}
-		s, err := newShard(cfg, sd)
+		s, err := newShard(cfg, sd, &c.onRemove)
 		if err != nil {
 			// Roll back already-constructed shards.
 			for j := 0; j < i; j++ {

@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
 
+	"github.com/rostamlabs/rostam/ops"
 	"github.com/rostamlabs/rostam/raft"
 )
 
@@ -140,6 +142,41 @@ func (s *Store) RestoreSnapshot(ctx context.Context, data []byte, appliedIndex u
 				wasmRestore = s.fsm.wasmRestore
 			}
 			_, rErr = restoreSnapshot(s.cache, s.vectors, wasmRestore, rc)
+			if rErr == nil {
+				// The KV record index is derived state — in no snapshot, no WAL
+				// and no log — so this install has just replaced the keyspace it
+				// describes, leaving it with postings for keys that are gone and
+				// NONE for the keys that arrived. Rebuild it against the same Set
+				// (restoreSnapshot refills the EXISTING cache, so the Set already
+				// wired to that cache's onRemove hook is the one to refill),
+				// inside the exclusive section so no write lands between the
+				// refill and the rebuild. It walks nothing when no definition is
+				// installed. The raft branch below reaches fsm.Restore, which
+				// does the same thing.
+				// Inside RunExclusive: a Close cannot interleave, so the walk
+				// cannot be cut short. If it ever were, kvindex publishes nothing
+				// and the index stays building — a retryable refusal, not a short
+				// answer.
+				//
+				// IT LENGTHENS THE EXCLUSIVE SECTION, past what RunExclusive's
+				// own contract asks for ("fn must be short — a single in-memory
+				// serialization"), because it adds one O(live keys) cache walk —
+				// re-resolving every visited entry against every installed
+				// definition — to a section that holds BOTH engine locks and
+				// therefore stalls the primary and backup write paths for its
+				// duration. Accepted here rather than moved out: a DR restore is
+				// already a whole-keyspace replacement on a node nobody is
+				// serving from, and the alternative — rebuilding after the locks
+				// drop — lets a write land between the refill and the rebuild,
+				// which is the one ordering that can strand a posting for a key
+				// the snapshot did not carry. The cost is zero on the ordinary
+				// deployment: with no definition installed the walk visits
+				// nothing at all.
+				if rebuildErr := ops.RebuildKVIndex(s.kvIdx, s.cache); rebuildErr != nil {
+					slog.Warn("kv index rebuild after a PB snapshot install did not finish; the index stays building until it is walked again",
+						"component", "shard", "err", rebuildErr)
+				}
+			}
 		})
 		if rErr != nil {
 			return fmt.Errorf("shard: RestoreSnapshot (pb): %w", rErr)

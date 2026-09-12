@@ -30,6 +30,10 @@ type Stats struct {
 	// block is a group that cannot APPLY an entry its log already carries.
 	WASMBlock WASMBlockStats
 
+	// KVIndex reports this node's KV record index: what is installed, what is
+	// usable, and what the derivation has cost.
+	KVIndex KVIndexStats
+
 	// WASMBlobRetire reports the blob retirement sweeper (see
 	// WASMBlobRetireStats). Retention == 0 means retirement is OFF, which is the
 	// default and the only configuration in which nothing can ever be removed.
@@ -102,4 +106,81 @@ type WASMGateStats struct {
 	// present here with a group MISSING is a wedged (op, group) pair — that is
 	// the diagnostic. Freshly allocated per call.
 	ProvenGroups map[string][]int
+}
+
+// KVIndexStats makes the KV record index observable.
+//
+// The index is DERIVED state — never snapshotted, never logged, never
+// replicated — installed from the meta catalog by a per-node polling observer
+// and filled by walking the local cache. That makes almost everything about it
+// invisible from the outside: a definition can be committed cluster-wide and
+// still be doing nothing on this node, and the two reasons for that (still
+// backfilling, or rejected at install) look identical to a client, which just
+// sees queries that do not use the index.
+type KVIndexStats struct {
+	// Definitions is how many distinct index definitions are installed on this
+	// node. It can lag the meta catalog by up to one observe interval, and sits
+	// BELOW it whenever Rejects is climbing.
+	Definitions int
+
+	// Ready is how many of those are ready on EVERY shard group this node hosts.
+	// A definition ready on some groups and building on others is not ready:
+	// answering from it would silently return a proper subset of the matches.
+	Ready int
+
+	// Backfills counts COMPLETED definition walks since process start.
+	// BackfillKeys counts cache entries visited by walks, completed or not — a
+	// walk aborted because its shard is being removed still contributes what it
+	// read before it stopped, because the cost was paid. So the two do not move
+	// together: a rise in BackfillKeys with Backfills flat is walks being
+	// abandoned, which is worth seeing rather than hiding. Both climb on a restart
+	// (the index is rebuilt from the cache every time) and on every new
+	// definition.
+	Backfills    uint64
+	BackfillKeys uint64
+
+	// Rejects counts reject EVENTS since process start: definitions the meta FSM
+	// ACCEPTED that this node cannot build, one per offending definition per
+	// observer pass. Monotonic, so it never goes backwards and a rate can be taken
+	// from it — but it keeps climbing while a bad definition simply sits in the
+	// catalog, which is why it is not the number to alert on.
+	Rejects uint64
+
+	// RejectedDefs is how many definitions the catalog holds RIGHT NOW that this
+	// node cannot build — a gauge, recomputed on every pass. A non-zero value is a
+	// standing misconfiguration (or a version skew): the definition exists
+	// cluster-wide and does nothing here. It returns to zero when the definition is
+	// fixed or removed, which is the signal an operator acts on.
+	RejectedDefs int
+
+	// VerifyMisses counts candidates whose live re-read MISSED — a posting for a
+	// key the cache no longer holds. Postings are hints, so this is a cost (one
+	// wasted lookup) and never a wrong answer; a rising rate means keys are
+	// leaving the cache by a path that does not reach kvindex.Set.Drop.
+	//
+	// IT IS KEY STALENESS ONLY, not value staleness. A candidate whose key is
+	// still live but whose VALUE no longer satisfies the filter is discarded by
+	// the predicate and counted nowhere — so a write path that stopped
+	// reindexing is invisible here, and this counter staying at zero is not
+	// evidence that the postings agree with the data. A separate counter for
+	// that is a follow-up.
+	//
+	// Monotonic across shard removal: RemoveShardOwner folds a departing group's
+	// count into the node total before its index is dropped.
+	VerifyMisses uint64
+
+	// ReconcileDrops counts postings the bounded reconcile pass removed because
+	// the key's live re-read MISSED. It is the residue VerifyMisses measures,
+	// finally collected: the pass exists to bound the MEMORY those postings hold,
+	// never to make an answer correct — verify-on-read already does that.
+	//
+	// A steady non-zero rate means keys are leaving the cache by a path that
+	// cannot name a key to kvindex.Set.Drop (a corrupt slot, a torn page's
+	// abandoned slots), or that a rebuild straddled a flush. Zero is the ordinary
+	// reading and does not mean the pass is not running.
+	//
+	// Monotonic across shard removal: RemoveShardOwner folds a departing group's
+	// count into the node total before its index is dropped. It stays at zero on
+	// a node whose stores run with shard.Config.KVIndexReconcileIntervalMs = 0.
+	ReconcileDrops uint64
 }

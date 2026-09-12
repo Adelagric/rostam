@@ -129,6 +129,70 @@ type Node struct {
 	// before tearing down meta-Raft (which the goroutine uses).
 	pbSeedWg sync.WaitGroup
 
+	// kvIndexStop signals the KV index observer goroutine to exit; kvIndexWg
+	// tracks it so Close waits for it before the shard stores it walks are torn
+	// down. kvIndexStopOnce makes stopKVIndexObserver idempotent, so a test may
+	// freeze the observer and Close may still run its own stop. nil in
+	// single-node mode (no meta catalog to derive definitions from).
+	kvIndexStop     chan struct{}
+	kvIndexWg       sync.WaitGroup
+	kvIndexStopOnce sync.Once
+	// kvIndexApplyMu serialises one whole install-and-backfill pass. The observer
+	// runs passes on its own goroutine and Close can race one; serialising them
+	// keeps two walks off the same definition, which the Set's generation guard
+	// survives but which would waste a full keyspace walk.
+	kvIndexApplyMu sync.Mutex
+	// kvIndexInstalled is the fingerprint (definitions + hosted groups) the last
+	// COMPLETED pass installed. A pass whose fingerprint matches skips the
+	// per-group Install entirely — the poll fires on every meta write, and PB
+	// liveness beacons alone would otherwise rebuild every Set once a second for a
+	// catalog that never changed. Guarded by kvIndexApplyMu, which a whole pass
+	// holds.
+	kvIndexInstalled string
+	// kvIndexPasses and kvIndexInstalls count passes run and passes that actually
+	// re-installed. They are diagnostics with no Stats field: what they exist for
+	// is to make "the observer stopped" and "the pass skipped its install"
+	// assertable, neither of which is visible in any other number.
+	kvIndexPasses   atomic.Uint64
+	kvIndexInstalls atomic.Uint64
+	// kvIndexWalkGates registers in-flight backfill walks per shard group so a
+	// shard removal can DRAIN them before closing the store the walk is reading
+	// out of. See cluster/kv_index_walkgate.go for why a drain rather than a flag.
+	kvIndexWalkMu    sync.Mutex
+	kvIndexWalkGates map[int]*kvIndexWalkGate
+	// kvIndexWalkAllClosed latches on the node-wide drain (Node.Close). Gates are
+	// created lazily, so without it a first walk on a never-walked group could
+	// create its gate after drainAllKVIndexWalks had already snapshotted the map
+	// and walk a store Close is about to unmap. While it is set, every gate handed
+	// out is born closed. Guarded by kvIndexWalkMu.
+	kvIndexWalkAllClosed bool
+
+	// KV index counters behind Stats().KVIndex. kvBackfills/kvBackfillKeys record
+	// what the observer's walks have cost; kvIndexRejects COUNTS reject events and
+	// kvIndexRejectedDefs GAUGES how many are broken right now (see
+	// kvIndexDefsFromCatalog for why both).
+	// kvIndexVerifyMisses and kvIndexReconcileDrops hold the counts that no
+	// longer have a hosted group to be read from: RemoveShardOwner folds a
+	// departing group's totals in here before dropping its index, so
+	// Stats().KVIndex.VerifyMisses and .ReconcileDrops (each this plus the sum
+	// over hosted groups) never decrease. Both are maintained on the per-shard
+	// kvindex.Set — the query leaf runs in ops, and the reconcile pass runs on a
+	// goroutine the store owns — so these node counters are only ever the
+	// residue of groups that have left.
+	kvBackfills         atomic.Uint64
+	kvBackfillKeys      atomic.Uint64
+	kvIndexRejects      atomic.Uint64
+	kvIndexRejectedDefs atomic.Uint64
+	// kvIndexRejectedNames is the same rejection as kvIndexRejectedDefs, BY NAME
+	// rather than by count, published as a whole immutable map on every observer
+	// pass. classifyKVQueryErr reads it to keep a definition this node can never
+	// build out of the retryable bucket; see kvIndexDefRejected. A count cannot
+	// answer "is THIS index the broken one", which is the only question that
+	// decides whether a client should retry.
+	kvIndexRejectedNames  atomic.Pointer[map[string]struct{}]
+	kvIndexVerifyMisses   atomic.Uint64
+	kvIndexReconcileDrops atomic.Uint64
+
 	// formationStop signals the shard-formation seeder and driver goroutines to
 	// exit (closed in Close). See cluster/shard_formation.go: these form the Raft
 	// groups whose owner set excludes the -bootstrap node, which nothing else does.
@@ -324,6 +388,11 @@ func newSingleNode(cfg Config) (*Node, error) {
 				return n.fetchShardLeaderFrontier(idx, d)
 			})
 		})
+		// A scan-mode kv_query walks this store's whole keyspace and aliases its
+		// live mmap, so it goes behind the same per-group gate the index backfill
+		// registers with — installed here, at the one moment the store exists and
+		// nothing can be walking it yet. See installKVQueryScanGate.
+		n.installKVQueryScanGate(i, store)
 		n.shards[i] = store
 	}
 
@@ -766,6 +835,11 @@ func newMultiNode(cfg Config) (*Node, error) {
 				return n.fetchShardLeaderFrontier(idx, d)
 			})
 		})
+		// A scan-mode kv_query walks this store's whole keyspace and aliases its
+		// live mmap, so it goes behind the same per-group gate the index backfill
+		// registers with — installed here, at the one moment the store exists and
+		// nothing can be walking it yet. See installKVQueryScanGate.
+		n.installKVQueryScanGate(i, store)
 		n.shards[i] = store
 
 		// Throttle: once the wave is full, wait for it to elect before the next.
@@ -1076,6 +1150,11 @@ func newMultiNode(cfg Config) (*Node, error) {
 	// still being built. A no-op unless cfg.WASMBlobRetention is set.
 	n.startWASMBlobRetirement()
 
+	// Started LAST, after every construction failure path has been passed: the
+	// observer installs into and walks the shard stores, so it must not be running
+	// over stores a late error is about to close. See startKVIndexObserver.
+	n.startKVIndexObserver()
+
 	return n, nil
 }
 
@@ -1167,6 +1246,16 @@ func (n *Node) Call(name string, args []byte) ([]byte, error) {
 	// WHOLE keyspace, and each group owns an independent cache. See broadcastFlush.
 	if name == flushOpName {
 		return n.broadcastFlush()
+	}
+	// kv_query is the READ with the same shape: keyless (so shardIndexFor returns
+	// 0 for it) but answering over the WHOLE keyspace, which lives in one
+	// independent cache per shard group. Routed like an ordinary shardless op it
+	// would answer from group 0's slice alone and present that as the complete
+	// result. Unlike the two broadcasts above it lands in no log at all — it fans a
+	// read-only leaf to every group that can still contribute rows and merges the
+	// pages. See broadcastKVQuery.
+	if name == kvQueryOpName {
+		return n.broadcastKVQuery(args)
 	}
 	idx, err := n.shardIndexFor(ke, layout, args)
 	if err != nil {
@@ -1438,11 +1527,33 @@ func (n *Node) CallPhysical(physCol, op string, args []byte, leaderOnly bool) ([
 // last error after the deadline rather than spinning forever. No sleep happens
 // once a leader is resolved and the call succeeds.
 func (n *Node) forwardToLeader(shardIdx int, op string, args []byte) ([]byte, error) {
+	return n.forwardToLeaderAs(context.Background(), shardIdx, op, args, op, args)
+}
+
+// forwardToLeaderAs is forwardToLeader with the LOCAL serve and the REMOTE hop
+// named separately, and with the caller's context bounding the wait.
+//
+// The two op names are the same for every caller but one. A fan-out leg cannot
+// send its own client-facing op name to a peer — the peer's Node.Call would fan
+// out again — so it carries a shard-scoped WRAPPER instead (see
+// opKVQueryShardName). That wrapper is a node-level admin op and is not in any
+// shard's op registry, so the moment leader resolution lands back on THIS node
+// the call has to switch to the leaf name and the leaf args. Sending the wrapper
+// to a local shard.Store would be an unknown op, not a query — a "leader is us"
+// race that would surface as a spurious failure for one page.
+//
+// ctx bounds the loop as well as each remote call: a leg that has already been
+// abandoned by its caller's per-group timeout stops retrying instead of holding
+// a peer connection for the rest of the internal deadline.
+func (n *Node) forwardToLeaderAs(ctx context.Context, shardIdx int, localOp string, localArgs []byte, remoteOp string, remoteArgs []byte) ([]byte, error) {
 	const (
 		deadline = 3 * time.Second // comfortably above the raft election timeout
 		backoff  = 25 * time.Millisecond
 	)
 	stopAt := time.Now().Add(deadline)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(stopAt) {
+		stopAt = dl
+	}
 	var lastErr = ErrNoShardOwner
 	for {
 		leaderAddr := n.leaderServerAddr(shardIdx)
@@ -1450,7 +1561,7 @@ func (n *Node) forwardToLeader(shardIdx int, op string, args []byte) ([]byte, er
 			// If the leader is this node, serve locally (it must host & lead the shard).
 			if leaderAddr == n.serverAddrFor(n.cfg.NodeID) {
 				if s := n.getShard(shardIdx); s != nil {
-					res, err := s.Call(op, args)
+					res, err := s.Call(localOp, localArgs)
 					if err == nil {
 						return res, nil
 					}
@@ -1461,13 +1572,16 @@ func (n *Node) forwardToLeader(shardIdx int, op string, args []byte) ([]byte, er
 				if err != nil {
 					lastErr = err
 				} else {
-					res, err := cl.Call(context.Background(), op, args)
+					res, err := cl.Call(ctx, remoteOp, remoteArgs)
 					if err == nil {
 						return res, nil
 					}
 					lastErr = err
 				}
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, lastErr
 		}
 		// Either the leader was unresolvable, or the call hit a transient error
 		// (NotLeader / unreachable / no-owner) during the election window. Retry
@@ -1755,6 +1869,7 @@ func (n *Node) Stats() Stats {
 			Skips: n.wasmBlobPushSkips.Load(),
 		},
 		WASMBlobRetire: n.wasmBlobRetireStats(),
+		KVIndex:        n.kvIndexStats(),
 	}
 	for i, s := range n.snapshotShards() {
 		if s == nil {
@@ -1862,6 +1977,13 @@ func (n *Node) Close() error {
 			close(n.pbSeedStop)
 			n.pbSeedWg.Wait()
 		}
+		// Stop the KV index observer before the shards close: it installs into and
+		// walks their caches, and a walk aliases a store's live mmap. Draining the
+		// walk gates first makes this bounded by a walk's abort check instead of by
+		// a whole full-keyspace walk; stopKVIndexObserver then waits for the pass
+		// itself, so no walk is in flight when the stores close below.
+		n.drainAllKVIndexWalks()
+		n.stopKVIndexObserver()
 		// Stop shard formation before the shards close: the driver calls
 		// BootstrapGroup on them.
 		if n.formationStop != nil {

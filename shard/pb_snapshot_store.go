@@ -5,9 +5,11 @@ package shard
 import (
 	"bytes"
 	"io"
+	"log/slog"
 	"sync/atomic"
 
 	"github.com/rostamlabs/rostam/cache"
+	"github.com/rostamlabs/rostam/ops"
 	"github.com/rostamlabs/rostam/shard/pbisr"
 	"github.com/rostamlabs/rostam/vector"
 )
@@ -85,6 +87,24 @@ func (p *pbSnapshotStore) InstallFSM(blob []byte) error {
 	_, err := restoreSnapshot(p.cache, p.vectors, wasmRestore, rc)
 	if err != nil {
 		return err
+	}
+	// The KV record index is derived state, carried in no snapshot, so this
+	// install just replaced the keyspace it describes: stale postings for keys
+	// that are gone, and NONE for the keys that arrived. Rebuild it against the
+	// same Set — restoreSnapshot refills the EXISTING cache, so the Set already
+	// wired to that cache's onRemove hook is the one to refill.
+	//
+	// Here rather than in CommitInstall because this is the call that holds
+	// writeMu+e.mu, so the refill and the rebuild are one critical section with
+	// no apply able to slip between them. Lock order is unchanged (cache, then
+	// index; Rebuild does not hold the index lock across its walk), and with no
+	// definition installed — the common case — it walks nothing.
+	if p.fsm != nil {
+		if err := ops.RebuildKVIndex(p.fsm.tx.KVIndex(), p.cache); err != nil {
+			// See fsm.Restore: nothing was published, so the index stays building.
+			slog.Warn("kv index rebuild after a PB snapshot install did not finish; the index stays building until it is walked again",
+				"component", "shard", "err", err)
+		}
 	}
 	p.installs.Add(1)
 	return nil
