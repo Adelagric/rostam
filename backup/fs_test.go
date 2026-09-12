@@ -97,3 +97,78 @@ func listTempFiles(t *testing.T, dir string) []string {
 	}
 	return tmps
 }
+
+// TestFSObjectStoreListPrefixScopedWalk pins that List, which now starts its
+// walk at the directory the prefix implies instead of at root, returns exactly
+// what a full-root walk filtered by key prefix would — including a trailing
+// partial segment ("acme/col/2024-"), a single exact key, a prefix whose
+// directory does not exist (nil, no error), and a ".." prefix (nothing, never
+// a path outside root).
+func TestFSObjectStoreListPrefixScopedWalk(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	fsStore, err := NewFSObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{
+		"acme/col/2024-01-01T00:00:00Z.snap",
+		"acme/col/2024-01-01T00:00:00Z.cfg.json",
+		"acme/col/2025-01-01T00:00:00Z.snap",
+		"acme/other/2024-01-01T00:00:00Z.snap",
+		"beta/col/2024-01-01T00:00:00Z.snap",
+		"top.snap",
+	}
+	for _, k := range keys {
+		if err := fsStore.Put(ctx, k, strings.NewReader(k), int64(len(k))); err != nil {
+			t.Fatalf("put %q: %v", k, err)
+		}
+	}
+	// A file outside root that a ".." prefix must never reach.
+	outside := filepath.Join(filepath.Dir(root), "outside.snap")
+	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(outside) })
+
+	listKeys := func(prefix string) []string {
+		t.Helper()
+		infos, err := fsStore.List(ctx, prefix)
+		if err != nil {
+			t.Fatalf("list %q: %v", prefix, err)
+		}
+		out := make([]string, 0, len(infos))
+		for _, in := range infos {
+			out = append(out, in.Key)
+		}
+		return out
+	}
+	// Reference: full-root walk filtered by key prefix.
+	fullWalk := func(prefix string) []string {
+		var out []string
+		for _, k := range keys {
+			if strings.HasPrefix(k, prefix) {
+				out = append(out, k)
+			}
+		}
+		sortStrings(out)
+		return out
+	}
+	for _, prefix := range []string{
+		"", "acme/", "acme/col/", "acme/col/2024-", "acme/col/2024-01-01T00:00:00Z.snap",
+		"acme/co", "top", "nope/", "acme/nope/2024-", "../", "../outside",
+	} {
+		got, want := listKeys(prefix), fullWalk(prefix)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("prefix %q: got %v, want %v", prefix, got, want)
+		}
+	}
+}
+
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
+}

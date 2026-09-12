@@ -157,18 +157,32 @@ func (f *FSObjectStore) Get(_ context.Context, key string) (io.ReadCloser, error
 	return file, nil
 }
 
-// List walks root and returns every object whose key begins with prefix (the
-// path relative to root, in forward-slash form), sorted by key. Directories are
-// not reported. A still-empty root yields no objects (nil), not an error.
+// List walks the subtree implied by prefix and returns every object whose key
+// begins with prefix (the path relative to root, in forward-slash form), sorted
+// by key. Directories are not reported. A still-empty root, or a prefix whose
+// directory does not exist yet, yields no objects (nil), not an error.
 //
-// NOTE: like the S3 store, List BUFFERS every matching key in memory (it walks
-// the whole tree and accumulates one ObjectInfo per file). This is bounded for
-// the backup/retention use (a handful of snapshots per collection prefix) but a
-// root holding millions of files will materialize them all at once; scope the
-// prefix narrowly for large trees.
+// The walk starts at the deepest directory the prefix fully names (for
+// "acme/col/2024-" that is <root>/acme/col), not at root: retention lists one
+// collection prefix per collection and per run, and an existence probe lists a
+// single key, so walking the whole root would make each backup run cost
+// O(collections × all stored files). The key-prefix filter is still applied to
+// every entry, so the result is identical to a full-root walk.
+//
+// NOTE: like the S3 store, List BUFFERS every matching key in memory (one
+// ObjectInfo per matching file). This is bounded for the backup/retention use
+// (a handful of snapshots per collection prefix) but a prefix spanning millions
+// of files will materialize them all at once; scope the prefix narrowly.
 func (f *FSObjectStore) List(_ context.Context, prefix string) ([]objstore.ObjectInfo, error) {
+	start := f.listStart(prefix)
+	if _, err := os.Stat(start); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("fsstore: list %q: %w", prefix, err)
+	}
 	var out []objstore.ObjectInfo
-	err := filepath.WalkDir(f.root, func(p string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(start, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -199,6 +213,28 @@ func (f *FSObjectStore) List(_ context.Context, prefix string) ([]objstore.Objec
 	}
 	sortInfosByKey(out)
 	return out, nil
+}
+
+// listStart returns the directory List should walk for prefix: <root> joined
+// with every COMPLETE "/"-separated segment of prefix (the trailing partial
+// segment, if any, is a name filter, not a directory). A prefix that would
+// escape root (".." segments) falls back to root itself, where the key-prefix
+// filter then matches nothing — never a path outside root.
+func (f *FSObjectStore) listStart(prefix string) string {
+	i := strings.LastIndex(prefix, "/")
+	if i < 0 {
+		return f.root
+	}
+	dir := filepath.Join(f.root, filepath.FromSlash(path.Clean("/"+prefix[:i])))
+	rootAbs, err := filepath.Abs(f.root)
+	if err != nil {
+		return f.root
+	}
+	dirAbs, err := filepath.Abs(dir)
+	if err != nil || (dirAbs != rootAbs && !strings.HasPrefix(dirAbs, rootAbs+string(os.PathSeparator))) {
+		return f.root
+	}
+	return dir
 }
 
 // Delete removes <root>/<key>. Deleting a missing key returns
