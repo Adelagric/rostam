@@ -258,8 +258,12 @@ func (f *FSObjectStore) List(_ context.Context, prefix string) ([]objstore.Objec
 // separator while the key filter treats it as a literal, so a scoped walk
 // there could return keys that do not carry the requested prefix — walking
 // from the parent lets the lexical filter decide, identically everywhere.
-// path.Clean resolves "."/".." and a leading "/" lexically; containment itself
-// is enforced by os.Root, not here.
+// A prefix whose directory part is not already canonical (a leading "/", a
+// "." or ".." segment, a doubled "/") can match no key at all — every key is
+// a clean relative path — so it yields nothing without touching disk, rather
+// than being scoped to the directory its CLEANED form names (which the raw
+// prefix would never match, and which could be a symlink the raw prefix would
+// never have reached). Containment itself is enforced by os.Root, not here.
 func listStart(r *os.Root, prefix string) (start string, ok bool, err error) {
 	start = "."
 	i := strings.LastIndex(prefix, "/")
@@ -267,6 +271,9 @@ func listStart(r *os.Root, prefix string) (start string, ok bool, err error) {
 		return start, true, nil
 	}
 	rel := strings.TrimPrefix(path.Clean("/"+prefix[:i]), "/")
+	if rel != prefix[:i] {
+		return "", false, nil // non-canonical directory part: no key can match
+	}
 	if rel == "" {
 		return start, true, nil
 	}

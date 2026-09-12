@@ -168,6 +168,7 @@ func TestFSObjectStoreListPrefixScopedWalk(t *testing.T) {
 		"acme/co", "top", "nope/", "acme/nope/2024-", "../", "../outside", "/acme/col/",
 		"top.snap/", "top.snap/x/y", "acme/col/2024-01-01T00:00:00Z.snap/x/",
 		"a\x00b/", "acme/\x00/", "bs/x\\", "bs\\x/", "bs\\x/y", "acme\\col/",
+		"./acme/col/", "acme/./col/", "acme/../acme/col/", "acme//col/", "/",
 	} {
 		got, want := listKeys(prefix), fullWalk(prefix)
 		if strings.Join(got, ",") != strings.Join(want, ",") {
@@ -224,6 +225,14 @@ func TestFSObjectStoreListRefusesSymlinkStart(t *testing.T) {
 			if strings.HasPrefix(in.Key, "link/") || strings.HasPrefix(in.Key, "rel/") || strings.HasPrefix(in.Key, "acme/relcol/") {
 				t.Errorf("list %q resolved a symlink: %q", prefix, in.Key)
 			}
+		}
+	}
+	// A non-canonical prefix that would CLEAN to a path through a link matches no
+	// key (keys are clean), so it must yield nothing — not the link error.
+	for _, prefix := range []string{"../link/col/", "acme/../rel/col/", "/rel/col/", "./acme/relcol/"} {
+		infos, err := fsStore.List(ctx, prefix)
+		if err != nil || len(infos) != 0 {
+			t.Errorf("list %q (non-canonical): got %d keys, err=%v; want none, nil", prefix, len(infos), err)
 		}
 	}
 	// Passing the links during a root walk still just reports them as entries.
