@@ -11,6 +11,7 @@ import (
 
 	"github.com/rostamlabs/rostam/authz"
 	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/server"
 	"github.com/rostamlabs/rostam/vector"
 )
 
@@ -270,4 +271,85 @@ func TestKeysDispatcherConcurrentAuthReadsAndAddWrite(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// appendingInner is a passThroughInner that also offers the optional
+// allocation-free path, so the wrapper's forwarding can be observed.
+type appendingInner struct {
+	passThroughInner
+	appendCalled bool
+}
+
+func (a *appendingInner) CallAppend(name string, _, dst []byte) ([]byte, error) {
+	a.appendCalled = true
+	a.lastOp = name
+	return append(dst, "INNER"...), nil
+}
+
+// The epoll transport takes the allocation-free path only when the dispatcher it
+// is handed implements server.AppendDispatcher — and NewServer ALWAYS wraps the
+// store in the keys decorator before handing it over. The decorator therefore has
+// to PRESERVE the inner dispatcher's capability in both directions, and both
+// directions have bitten:
+//
+//   - dropping it killed the append path in production (single-node) while every
+//     handler-level benchmark still looked green;
+//   - faking it made the cluster path allocate a reply buffer AND copy the whole
+//     reply into it, which is worse than the plain Call path it replaced.
+func TestWrapKeysDispatcherPreservesAppendCapability(t *testing.T) {
+	t.Run("inner can append", func(t *testing.T) {
+		inner := &appendingInner{}
+		w := wrapKeysDispatcher(inner, nil)
+
+		ad, ok := w.(server.AppendDispatcher)
+		if !ok {
+			t.Fatal("wrapper dropped the inner dispatcher's append path; every get and operate would allocate its reply")
+		}
+		got, err := ad.CallAppend("get", []byte("args"), []byte("DST"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !inner.appendCalled {
+			t.Error("wrapper served the op itself instead of forwarding CallAppend")
+		}
+		if string(got) != "DSTINNER" {
+			t.Errorf("payload = %q, want the inner reply appended to dst", got)
+		}
+	})
+
+	t.Run("inner cannot append", func(t *testing.T) {
+		w := wrapKeysDispatcher(&passThroughInner{}, nil)
+		if _, ok := w.(server.AppendDispatcher); ok {
+			t.Error("wrapper advertises an append path its inner cannot serve; the transport would allocate a buffer and copy every reply into it for nothing")
+		}
+	})
+}
+
+// The intercepted keys ops are administrative: served by the wrapper itself,
+// never forwarded to the inner dispatcher. A LIVE registry is required to see
+// that — with a nil one every keys op fails with ErrKeyAdminUnavailable before
+// producing a frame, so the assertion would hold vacuously.
+func TestKeysAppendDispatcherKeepsKeysOpsLocal(t *testing.T) {
+	reg, _ := newTestRegistry(t)
+	inner := &appendingInner{}
+	ad, ok := wrapKeysDispatcher(inner, reg).(server.AppendDispatcher)
+	if !ok {
+		t.Fatal("expected an append-capable wrapper")
+	}
+
+	got, err := ad.CallAppend(ops.OpKeysList, nil, []byte("DST"))
+	if err != nil {
+		t.Fatalf("keys list: %v", err)
+	}
+	if inner.appendCalled {
+		t.Error("a keys op was forwarded to the inner dispatcher instead of being served locally")
+	}
+	if len(got) == 0 {
+		t.Error("keys list produced no frame")
+	}
+	// It is served locally, so the frame is its own rather than an append onto
+	// dst — the payload is explicitly allowed not to alias.
+	if bytes.HasPrefix(got, []byte("DST")) {
+		t.Error("the keys frame was copied into dst; it should be returned as is")
+	}
 }

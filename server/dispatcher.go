@@ -22,3 +22,22 @@ type Dispatcher interface {
 	Call(name string, args []byte) ([]byte, error)
 	LeaderAddr() string
 }
+
+// AppendDispatcher is the OPTIONAL allocation-free twin of Dispatcher. A
+// dispatcher that implements it can serve a call into a buffer the transport
+// owns, so a reply costs no allocation at all.
+//
+// The returned payload MAY alias dst — an op with an append variant writes into
+// it, one without returns its own freshly built reply, and copying the latter
+// into dst just to make the aliasing uniform would add a full reply copy to
+// nearly every op. When it does alias, it is valid only until dst is reused,
+// which is why this is opt-in rather than part of Dispatcher: only a transport
+// that copies the payload out before its next call on that connection may ask
+// for it. A caller reusing dst must therefore check (see sharesArray) rather
+// than assume.
+// The epoll server qualifies — epollConn.encode copies the payload into the
+// response frame before the loop reads the next request. A dispatcher that does
+// not implement this is served through Call exactly as before.
+type AppendDispatcher interface {
+	CallAppend(name string, args, dst []byte) ([]byte, error)
+}
