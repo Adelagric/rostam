@@ -41,8 +41,11 @@ var _ objstore.ObjectStore = (*FSObjectStore)(nil)
 // published object. A staging file left behind by a process killed mid-Put is
 // not auto-reclaimed here — a startup sweep would race a concurrent writer on a
 // shared root and cannot tell a final key from a temp by prefix alone, so
-// reclaiming leftovers is left to a later Put to the same key or to maintenance.
-// It is a small, inert file, never selectable as a snapshot.
+// reclaiming leftovers is left to maintenance (tracked in #115). Note what
+// accumulates: the same Put stages the SNAPSHOT, so a kill mid-copy leaves a
+// partial snapshot as large as whatever had been copied — potentially many GB
+// on a large collection — inert (never selectable as a snapshot) but not small,
+// and unbounded across repeated interrupted backups until reclaimed.
 const putTempPrefix = ".rostam-put-"
 
 // NewFSObjectStore returns an FSObjectStore rooted at root, creating root if it
