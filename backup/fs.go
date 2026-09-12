@@ -4,6 +4,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/rostamlabs/rostam/objstore"
 )
@@ -157,44 +159,72 @@ func (f *FSObjectStore) Get(_ context.Context, key string) (io.ReadCloser, error
 	return file, nil
 }
 
-// List walks the subtree implied by prefix and returns every object whose key
-// begins with prefix (the path relative to root, in forward-slash form), sorted
-// by key. Directories are not reported. A still-empty root, or a prefix whose
-// directory does not exist yet, yields no objects (nil), not an error.
+// List returns every object whose key begins with prefix (the path relative to
+// root, in forward-slash form), sorted by key. Directories are not reported.
 //
 // The walk starts at the deepest directory the prefix fully names (for
-// "acme/col/2024-" that is <root>/acme/col), not at root: retention lists one
+// "acme/col/2024-" that is acme/col), not at root: retention lists one
 // collection prefix per collection and per run, and an existence probe lists a
 // single key, so walking the whole root would make each backup run cost
 // O(collections × all stored files). The key-prefix filter is still applied to
-// every entry, so the result is identical to a full-root walk.
+// every entry, so the result is what a full-root walk filtered by prefix would
+// return.
+//
+// The walk runs inside os.Root, so it cannot leave root through a symlink: the
+// kernel-level check refuses a start path with a symlink in ANY component —
+// even one that stays inside root — rather than resolving it. A full-root walk
+// never descended into a symlink either, so nothing under one was ever
+// listable; the difference is that it stayed silent, whereas List now returns
+// an error. That is deliberate: a tenant directory an operator symlinked onto
+// another disk otherwise surfaces as "no snapshots" from LatestKey/RestoreLatest
+// and as a silent no-op from prune, when the truth is that List cannot see it.
+// path.Clean on the prefix is the only lexical defence and it is not relied on
+// for containment.
+//
+// Error semantics, matching MemStore.List (a pure prefix filter, which cannot
+// fail on the SHAPE of a prefix): a prefix whose directory does not exist yet,
+// or whose directory component names a plain file, or that contains a NUL
+// byte (no key can — keyToPath rejects it) yields no objects (nil), not an
+// error. A missing or unreadable ROOT is an error, as it always was: an
+// unmounted backup volume must not read as "no snapshots".
+//
+// On a case-insensitive filesystem (darwin, Windows) a prefix that differs
+// from the on-disk name only by case walks the directory and yields keys in the
+// prefix's case, where a full-root walk yielded the on-disk case and matched
+// nothing. No caller re-cases a prefix (tenants are validated, collections
+// escaped), so this is documented rather than defended.
 //
 // NOTE: like the S3 store, List BUFFERS every matching key in memory (one
 // ObjectInfo per matching file). This is bounded for the backup/retention use
 // (a handful of snapshots per collection prefix) but a prefix spanning millions
 // of files will materialize them all at once; scope the prefix narrowly.
 func (f *FSObjectStore) List(_ context.Context, prefix string) ([]objstore.ObjectInfo, error) {
-	start := f.listStart(prefix)
-	if _, err := os.Stat(start); err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
+	if strings.ContainsRune(prefix, '\x00') {
+		return nil, nil
+	}
+	r, err := os.OpenRoot(f.root)
+	if err != nil {
+		return nil, fmt.Errorf("fsstore: list %q: open root: %w", prefix, err)
+	}
+	defer func() { _ = r.Close() }()
+	fsys := r.FS()
+	start := listStart(prefix)
+	if _, err := fs.Stat(fsys, start); err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return nil, nil // no such prefix: nothing to list
 		}
 		return nil, fmt.Errorf("fsstore: list %q: %w", prefix, err)
 	}
 	var out []objstore.ObjectInfo
-	err := filepath.WalkDir(start, func(p string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(fsys, start, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
 			return nil
 		}
-		rel, rerr := filepath.Rel(f.root, p)
-		if rerr != nil {
-			return rerr
-		}
-		key := filepath.ToSlash(rel)
-		if !strings.HasPrefix(key, prefix) {
+		// fs.FS paths are already slash-separated and root-relative: p IS the key.
+		if !strings.HasPrefix(p, prefix) {
 			return nil
 		}
 		info, ierr := d.Info()
@@ -202,7 +232,7 @@ func (f *FSObjectStore) List(_ context.Context, prefix string) ([]objstore.Objec
 			return ierr
 		}
 		out = append(out, objstore.ObjectInfo{
-			Key:          key,
+			Key:          p,
 			Size:         info.Size(),
 			LastModified: info.ModTime(),
 		})
@@ -215,26 +245,21 @@ func (f *FSObjectStore) List(_ context.Context, prefix string) ([]objstore.Objec
 	return out, nil
 }
 
-// listStart returns the directory List should walk for prefix: <root> joined
-// with every COMPLETE "/"-separated segment of prefix (the trailing partial
-// segment, if any, is a name filter, not a directory). A prefix that would
-// escape root (".." segments) falls back to root itself, where the key-prefix
-// filter then matches nothing — never a path outside root.
-func (f *FSObjectStore) listStart(prefix string) string {
+// listStart returns the fs.FS path (unrooted, slash-separated, "." for root)
+// List should walk for prefix: every COMPLETE "/"-separated segment of prefix.
+// The trailing partial segment, if any, is a name filter, not a directory.
+// path.Clean resolves "."/".." and a leading "/" lexically; containment itself
+// is enforced by os.Root, not here.
+func listStart(prefix string) string {
 	i := strings.LastIndex(prefix, "/")
 	if i < 0 {
-		return f.root
+		return "."
 	}
-	dir := filepath.Join(f.root, filepath.FromSlash(path.Clean("/"+prefix[:i])))
-	rootAbs, err := filepath.Abs(f.root)
-	if err != nil {
-		return f.root
+	rel := strings.TrimPrefix(path.Clean("/"+prefix[:i]), "/")
+	if rel == "" {
+		return "."
 	}
-	dirAbs, err := filepath.Abs(dir)
-	if err != nil || (dirAbs != rootAbs && !strings.HasPrefix(dirAbs, rootAbs+string(os.PathSeparator))) {
-		return f.root
-	}
-	return dir
+	return rel
 }
 
 // Delete removes <root>/<key>. Deleting a missing key returns

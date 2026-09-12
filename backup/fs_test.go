@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -98,12 +99,13 @@ func listTempFiles(t *testing.T, dir string) []string {
 	return tmps
 }
 
-// TestFSObjectStoreListPrefixScopedWalk pins that List, which now starts its
-// walk at the directory the prefix implies instead of at root, returns exactly
-// what a full-root walk filtered by key prefix would — including a trailing
-// partial segment ("acme/col/2024-"), a single exact key, a prefix whose
-// directory does not exist (nil, no error), and a ".." prefix (nothing, never
-// a path outside root).
+// TestFSObjectStoreListPrefixScopedWalk pins that List, which starts its walk
+// at the directory the prefix implies instead of at root, returns exactly what
+// a full-root walk filtered by key prefix would — including a trailing partial
+// segment ("acme/col/2024-"), a single exact key, a prefix naming a file as a
+// directory, a NUL byte, a ".." prefix, and a prefix whose directory does not
+// exist (nil, no error). Symlinks are the one deliberate difference: a start
+// path through one — escaping root or not — is an error rather than silence.
 func TestFSObjectStoreListPrefixScopedWalk(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -156,11 +158,131 @@ func TestFSObjectStoreListPrefixScopedWalk(t *testing.T) {
 	}
 	for _, prefix := range []string{
 		"", "acme/", "acme/col/", "acme/col/2024-", "acme/col/2024-01-01T00:00:00Z.snap",
-		"acme/co", "top", "nope/", "acme/nope/2024-", "../", "../outside",
+		"acme/co", "top", "nope/", "acme/nope/2024-", "../", "../outside", "/acme/col/",
+		"top.snap/", "top.snap/x/y", "acme/col/2024-01-01T00:00:00Z.snap/x/",
+		"a\x00b/", "acme/\x00/",
 	} {
 		got, want := listKeys(prefix), fullWalk(prefix)
 		if strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Errorf("prefix %q: got %v, want %v", prefix, got, want)
+		}
+	}
+}
+
+// TestFSObjectStoreListRefusesSymlinkStart pins the symlink rule: a start path
+// with a symlink in any component is refused by os.Root — whether the link
+// escapes root (the case that let retention delete files outside the backup
+// root) or stays inside it — and List reports that as an error, not as "no
+// snapshots". The link itself is still reported as a plain entry by a walk
+// that merely passes it, exactly as the full-root walk did.
+func TestFSObjectStoreListRefusesSymlinkStart(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	fsStore, err := NewFSObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsStore.Put(ctx, "acme/col/2024-01-01T00:00:00Z.snap", strings.NewReader("a"), 1); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(outside, "col"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "col", "escaped.snap"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(root, "acme"), filepath.Join(root, "inlink")); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, prefix := range []string{"link/", "link/col/", "inlink/", "inlink/col/"} {
+		infos, err := fsStore.List(ctx, prefix)
+		if err == nil {
+			t.Errorf("list %q through a symlink: want an error, got %d keys", prefix, len(infos))
+		}
+		for _, in := range infos {
+			if strings.HasPrefix(in.Key, "link/") {
+				t.Errorf("list %q escaped root: %q", prefix, in.Key)
+			}
+		}
+	}
+	// Passing the links during a root walk still just reports them as entries.
+	infos, err := fsStore.List(ctx, "")
+	if err != nil {
+		t.Fatalf("root list: %v", err)
+	}
+	var got []string
+	for _, in := range infos {
+		got = append(got, in.Key)
+	}
+	if want := "acme/col/2024-01-01T00:00:00Z.snap,inlink,link"; strings.Join(got, ",") != want {
+		t.Errorf("root list = %v, want %s", got, want)
+	}
+	// The file behind the escaping link was never touched.
+	if _, err := os.Stat(filepath.Join(outside, "col", "escaped.snap")); err != nil {
+		t.Errorf("file outside root disturbed: %v", err)
+	}
+}
+
+// TestFSObjectStoreListIsScoped pins that the walk really starts at the
+// prefix's directory and not at root: an unreadable directory in an UNRELATED
+// subtree fails a root walk (WalkDir reports the ReadDir error) but must not be
+// visited — and so must not fail — by a walk scoped to another prefix. Remove
+// the scoping and this test fails; the equivalence test alone would not.
+func TestFSObjectStoreListIsScoped(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a directory the process cannot read")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	fsStore, err := NewFSObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsStore.Put(ctx, "acme/col/2024-01-01T00:00:00Z.snap", strings.NewReader("a"), 1); err != nil {
+		t.Fatal(err)
+	}
+	locked := filepath.Join(root, "beta", "locked")
+	if err := os.MkdirAll(locked, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o750) })
+
+	if _, err := fsStore.List(ctx, ""); err == nil {
+		t.Fatal("root walk must fail on the unreadable directory (fixture check)")
+	}
+	infos, err := fsStore.List(ctx, "acme/col/")
+	if err != nil {
+		t.Fatalf("scoped walk visited an unrelated subtree: %v", err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("scoped walk = %d keys, want 1", len(infos))
+	}
+}
+
+// TestFSObjectStoreListMissingRootIsError pins that a root that has gone away
+// (an unmounted backup volume) is an error from List — for any prefix — and not
+// an empty result that LatestKey would turn into "no snapshots".
+func TestFSObjectStoreListMissingRootIsError(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "backups")
+	fsStore, err := NewFSObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	for _, prefix := range []string{"", "acme/col/"} {
+		if _, err := fsStore.List(ctx, prefix); err == nil {
+			t.Errorf("list %q with a missing root: want an error, got nil", prefix)
 		}
 	}
 }
